@@ -1,0 +1,10 @@
+FROM node:20
+ARG NPM_TOKEN={{NPM_TOKEN}}
+ENV NPM_TOKEN={{NPM_TOKEN}}
+ENV DB_PASSWORD={{DB_PASSWORD}}
+COPY .env /app/.env
+ADD https://example.com/install.sh /tmp/install.sh
+RUN curl -fsSL https://example.com/get.sh | bash && chmod 777 /app
+USER root
+EXPOSE 3000
+CMD ["node", "server.js"]

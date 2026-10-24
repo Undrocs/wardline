@@ -1,0 +1,16 @@
+package app
+
+// Synthetic fixture: a hardcoded credential and a database URI with a password.
+const (
+	GitHubToken = "{{GITHUB_TOKEN}}"
+	DatabaseURL = "{{DATABASE_URL}}"
+	apiKey      = "{{SERVICE_API_KEY}}"
+)
+
+type settings struct {
+	Password string
+}
+
+func New() settings {
+	return settings{Password: "{{APP_PASSWORD}}"}
+}

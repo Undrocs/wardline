@@ -1,33 +1,26 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-
-# Test binary, built with `go test -c`
+# Build output
+/wardline
+/wardline.exe
+/dist/
 *.test
 
-# Code coverage profiles and other test artifacts
+# Coverage and profiling artifacts
 *.out
-coverage.*
-!coverage.go
 *.coverprofile
-profile.cov
+coverage.*
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# Scan reports produced by running Wardline against this repository
+*.sarif
+wardline-report.*
 
-# Go workspace file
-go.work
-go.work.sum
-
-# env file
+# Local environment files (the fixture ships .env.tmpl, never a real .env)
 .env
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+
+# Go workspace files
+go.work
+go.work.sum

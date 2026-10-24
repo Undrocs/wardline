@@ -1,0 +1,13 @@
+services:
+  api:
+    image: example/api:1.4.2
+    read_only: true
+    user: "1000:1000"
+    cap_drop:
+      - ALL
+    environment:
+      DB_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./data:/data:ro
+    ports:
+      - "127.0.0.1:8080:8080"

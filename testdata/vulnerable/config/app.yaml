@@ -1,0 +1,6 @@
+tls:
+  verify: false
+  insecure_skip_verify: true
+database:
+  host: db.internal
+  sslmode: require

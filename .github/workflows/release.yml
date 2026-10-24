@@ -1,0 +1,171 @@
+name: Release
+
+# Builds release archives for Linux, macOS and Windows on amd64 and arm64 and
+# attaches them, with a SHA-256 checksum file, to a GitHub release.
+#
+# This workflow is scaffolding: it only runs when a tag matching v* is pushed
+# (or when started manually). No release has been published for this project
+# yet, and no artifacts are committed to the repository.
+#
+# Security notes:
+#   - actions are pinned to full commit SHAs;
+#   - the default permission is contents: read; only the publish job is granted
+#     contents: write, and it runs after every build job succeeds;
+#   - no third-party release action is used: archives are built with the Go
+#     toolchain and published with the GitHub CLI that ships on the runner.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (for example v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            archive: tar.gz
+          - goos: darwin
+            goarch: amd64
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            archive: zip
+          - goos: windows
+            goarch: arm64
+            archive: zip
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test before packaging
+        run: go test ./... -timeout 300s
+
+      - name: Build archive
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          ARCHIVE: ${{ matrix.archive }}
+          # Event data is passed through the environment, never interpolated
+          # into the script body.
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            tag="${DISPATCH_TAG}"
+          fi
+          version="${tag#v}"
+          commit="$(git rev-parse HEAD)"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          name="wardline_${version}_${GOOS}_${GOARCH}"
+
+          mkdir -p "dist/${name}"
+          go build -trimpath \
+            -ldflags "-s -w \
+              -X github.com/Undrocs/wardline/internal/version.Version=${version} \
+              -X github.com/Undrocs/wardline/internal/version.Commit=${commit} \
+              -X github.com/Undrocs/wardline/internal/version.BuildDate=${build_date}" \
+            -o "dist/${name}/wardline" ./cmd/wardline
+
+          # Ship the license, notices and user documentation with the binary.
+          cp LICENSE THIRD-PARTY-NOTICES.md README.md CHANGELOG.md "dist/${name}/"
+
+          # Reproducible archive: fixed mtime/owner and sorted entries.
+          if [ "${GOOS}" = "windows" ]; then
+            (cd dist && rm -f "${name}.zip" && zip -qr9 "${name}.zip" "${name}")
+          else
+            (cd dist && tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime='UTC 2026-01-01' -czf "${name}.${ARCHIVE}" "${name}")
+          fi
+          (cd dist && sha256sum "${name}.${ARCHIVE}" > "${name}.${ARCHIVE}.sha256")
+
+      - name: Upload archives
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wardline-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          retention-days: 14
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Assemble checksums
+        run: |
+          set -eu
+          cd dist
+          ls -l
+          # Sort so the checksum file is stable regardless of upload order.
+          cat ./*.sha256 | sort -k2 > SHA256SUMS
+          rm -f ./*.sha256
+          sha256sum --check SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            tag="${DISPATCH_TAG}"
+          fi
+          if gh release view "${tag}" > /dev/null 2>&1; then
+            gh release upload "${tag}" dist/* --clobber
+          else
+            gh release create "${tag}" dist/* \
+              --verify-tag \
+              --title "Wardline ${tag}" \
+              --notes "See CHANGELOG.md for the changes in this release. Verify downloads with SHA256SUMS."
+          fi

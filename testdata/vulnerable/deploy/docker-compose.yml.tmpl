@@ -1,0 +1,18 @@
+services:
+  api:
+    image: example/api:latest
+    privileged: true
+    network_mode: host
+    user: "0"
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      - DB_PASSWORD={{DB_PASSWORD}}
+      - API_KEY={{SERVICE_API_KEY}}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc:/host-etc
+    ports:
+      - "5432:5432"

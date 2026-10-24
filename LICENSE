@@ -1,0 +1,57 @@
+Copyright © 2026 Undrocs. All rights reserved.
+
+Wardline — PROPRIETARY, SOURCE-AVAILABLE SOFTWARE
+
+Wardline (the "Software") is proprietary software developed and owned by
+Undrocs. The Software is made available in source form for transparency,
+security review, and educational inspection only.
+
+1. NO LICENSE GRANTED
+
+   No license, express or implied, is granted to use, copy for any purpose other
+   than inspection, modify, adapt, translate, merge, publish, distribute,
+   sublicense, sell, commercially exploit, or repackage the Software, in whole
+   or in part. All rights not expressly granted are reserved by Undrocs.
+
+2. PERMITTED INSPECTION
+
+   You may view and read the source code, and you may run the Software for your
+   own internal evaluation, provided that every copy you retain or display
+   includes this notice and the copyright statement above.
+
+3. NO TRADEMARK RIGHTS
+
+   The "Wardline" and "Undrocs" names, logos, and branding are trademarks of
+   Undrocs. They may not be used to impersonate, misrepresent, or imply
+   endorsement of any product or service without prior written permission.
+
+4. NO CONTRIBUTIONS WITHOUT AGREEMENT
+
+   Contributions are accepted only under the terms described in CONTRIBUTING.md,
+   which requires granting Undrocs the rights needed to distribute the
+   contribution as part of this proprietary project.
+
+5. THIRD-PARTY COMPONENTS
+
+   The Software includes third-party components listed in
+   THIRD-PARTY-NOTICES.md, each governed by its own license. Nothing in this
+   notice limits rights granted to you by those licenses.
+
+6. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. IN NO EVENT
+   SHALL UNDROCS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER
+   IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN
+   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+7. SECURITY TOOL DISCLAIMER
+
+   Wardline is a static analysis tool. It does not guarantee that a repository,
+   container image, dependency set, or deployment is secure, and a scan without
+   findings must not be treated as evidence of security. See docs/limitations.md.
+
+For licensing enquiries, contact the repository owner through the Undrocs
+GitHub organisation. Do not send security reports to a general address; see
+SECURITY.md.

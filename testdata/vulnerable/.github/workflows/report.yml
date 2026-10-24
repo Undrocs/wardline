@@ -1,0 +1,9 @@
+name: Report
+on: push
+permissions:
+  issues: write
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "report"

@@ -1,0 +1,175 @@
+name: CI
+
+# Continuous integration for Wardline.
+#
+# Security notes:
+#   - every action is pinned to a full commit SHA;
+#   - the default token permission is contents: read;
+#   - no workflow here uses pull_request_target, and no secrets are available
+#     to pull requests from forks;
+#   - scanned content is never executed: the self-scan only runs Wardline
+#     itself against this checkout.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  format-vet:
+    name: Format, vet and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Verify go.mod and go.sum are tidy
+        run: |
+          set -eu
+          cp go.mod go.mod.orig
+          cp go.sum go.sum.orig
+          go mod tidy
+          diff -u go.mod.orig go.mod
+          diff -u go.sum.orig go.sum
+          rm -f go.mod.orig go.sum.orig
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test ./... -timeout 300s
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests with the race detector
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race ./... -timeout 600s
+
+  fuzz-smoke:
+    name: Fuzz smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Fuzz parsers and the secrets scanner (time-boxed)
+        run: |
+          set -eu
+          go test ./internal/scanners/secrets/ -run '^$' -fuzz '^FuzzScan$' -fuzztime 20s
+          go test ./internal/yamlpos/ -run '^$' -fuzz '^FuzzParse$' -fuzztime 20s
+          go test ./internal/scanners/workflows/ -run '^$' -fuzz '^FuzzWorkflowRules$' -fuzztime 20s
+          go test ./internal/scanners/config/ -run '^$' -fuzz '^FuzzCheckDockerfile$' -fuzztime 20s
+          go test ./internal/scanners/config/ -run '^$' -fuzz '^FuzzCheckCompose$' -fuzztime 20s
+
+  self-scan:
+    name: Self-scan (offline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run the smoke script (exit codes and redaction)
+        run: sh scripts/smoke.sh
+
+      - name: Build Wardline
+        run: go build -o wardline ./cmd/wardline
+
+      - name: Scan this repository
+        run: |
+          set -eu
+          ./wardline scan . --offline --no-color --format json --output /tmp/wardline-selfscan.json
+          ./wardline scan . --offline --no-color --format sarif --output /tmp/wardline-selfscan.sarif
+          ./wardline scan . --offline --no-color --format terminal --fail-on critical
+
+      - name: Fail if any secret value is present in the report
+        run: |
+          set -eu
+          # Reports must never contain the synthetic markers used in fixtures.
+          if grep -Eq 'ghp_[A-Za-z0-9]{36}|AKIA[0-9A-Z]{16}' /tmp/wardline-selfscan.json; then
+            echo "report contains what looks like an unmasked credential"
+            exit 1
+          fi
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: self-scan-reports
+          path: /tmp/wardline-selfscan.*
+          retention-days: 7
+          if-no-files-found: warn
