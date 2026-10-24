@@ -1,0 +1,21 @@
+name: Unsafe
+on:
+  pull_request_target:
+    types: [opened]
+permissions: write-all
+jobs:
+  build:
+    runs-on: [self-hosted, linux]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: some-org/third-party-action@main
+      - name: Greet
+        run: |
+          echo "Hello ${{ github.event.pull_request.title }}"
+          curl -sSL https://example.com/setup.sh | bash
+      - name: Debug token
+        run: echo "${{ secrets.DEPLOY_TOKEN }}"
+      - name: Download
+        uses: actions/download-artifact@v4

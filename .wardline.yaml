@@ -1,0 +1,39 @@
+# Wardline's own configuration.
+#
+# The synthetic fixtures under testdata/ deliberately contain fake credentials
+# and insecure configurations, so they are excluded from self-scans. Tests scan
+# them explicitly with dedicated expectations.
+version: 1
+
+scanners:
+  secrets: true
+  dependencies: true
+  workflows: true
+  config: true
+
+exclude:
+  # Test sources embed deliberately synthetic credentials to exercise the
+  # detection rules (for example fake GitHub tokens and PEM headers). Scanning
+  # them would report the scanner's own fixtures on every run.
+  - "**/*_test.go"
+  - "testdata/**"
+
+limits:
+  maxFileSize: 2MiB
+  maxFiles: 100000
+  workers: 8
+
+severity:
+  failOn: high
+
+report:
+  format: terminal
+  minSeverity: info
+
+timeouts:
+  scan: 5m
+  http: 20s
+
+network:
+  enabled: true
+  osvEndpoint: https://api.osv.dev

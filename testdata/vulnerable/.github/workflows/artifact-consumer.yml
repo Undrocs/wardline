@@ -1,0 +1,15 @@
+name: Consume
+on:
+  workflow_run:
+    workflows: ["Unsafe"]
+    types: [completed]
+permissions:
+  contents: read
+jobs:
+  consume:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build
+      - run: bash ./build/output.sh

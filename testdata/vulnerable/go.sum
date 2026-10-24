@@ -1,0 +1,6 @@
+github.com/golang-jwt/jwt v3.2.1+incompatible h1:Q7mXr4Tz9KpL2WcV8bN3jH6yF5dS1aE0uG8iExample=
+github.com/golang-jwt/jwt v3.2.1+incompatible/go.mod h1:Q7mXr4Tz9KpL2WcV8bN3jH6yF5dS1aE0uG8iExample=
+golang.org/x/crypto v0.11.0 h1:Yk4mPz9Qw2Er7Tt5Lm4Qp9Zx2Tr7Wc5VExample00=
+golang.org/x/crypto v0.11.0/go.mod h1:Yk4mPz9Qw2Er7Tt5Lm4Qp9Zx2Tr7Wc5VExample00=
+golang.org/x/net v0.10.0 h1:Lm4Qp9Zx2Tr7Wc5VLm4Qp9Zx2Tr7Wc5VExample000=
+golang.org/x/net v0.10.0/go.mod h1:Lm4Qp9Zx2Tr7Wc5VLm4Qp9Zx2Tr7Wc5VExample000=

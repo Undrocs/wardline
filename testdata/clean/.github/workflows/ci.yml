@@ -1,0 +1,20 @@
+name: CI
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Run tests
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "validating pull request"
+          go test ./...
+      - name: Report
+        run: echo "title length is ${#TITLE}"

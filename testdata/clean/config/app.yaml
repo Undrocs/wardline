@@ -1,0 +1,6 @@
+tls:
+  verify: true
+  min_version: "1.2"
+database:
+  host: db.internal
+  sslmode: verify-full
