@@ -114,7 +114,7 @@ func collectFiles(ctx context.Context, root string, cfg *config.Config) ([]scann
 			stats.Irregular++
 			return nil
 		}
-		files = append(files, scanners.File{Rel: rel, Abs: abs, Size: info.Size()})
+		files = append(files, scanners.File{Rel: rel, Abs: abs, Size: info.Size(), Info: info})
 		stats.Files++
 		stats.Bytes += info.Size()
 		return nil

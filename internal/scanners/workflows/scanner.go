@@ -52,7 +52,7 @@ func (s *Scanner) Scan(ctx context.Context, req *scanners.Request) (*scanners.Re
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		data, err := security.ReadFileLimited(file.Abs, req.Config.Limits.MaxFileSize)
+		data, err := security.ReadFileLimitedVerified(file.Abs, file.Info, req.Config.Limits.MaxFileSize)
 		if err != nil {
 			res.Warnings = append(res.Warnings, fmt.Sprintf("%s: could not be read: %v", file.Rel, err))
 			res.Skipped = append(res.Skipped, scanners.SkippedCheck{

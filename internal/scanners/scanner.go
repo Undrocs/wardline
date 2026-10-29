@@ -8,6 +8,7 @@ package scanners
 import (
 	"context"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/Undrocs/wardline/internal/config"
@@ -22,6 +23,10 @@ type File struct {
 	Abs string
 	// Size is the file size in bytes at traversal time.
 	Size int64
+	// Info is the metadata recorded during traversal. Scanners pass it to
+	// security.ReadFileLimitedVerified so a file that was replaced between the
+	// walk and the read is rejected instead of silently scanned.
+	Info os.FileInfo
 }
 
 // Status describes how a scanner run finished.

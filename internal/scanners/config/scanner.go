@@ -37,7 +37,7 @@ func (s *Scanner) Scan(ctx context.Context, req *scanners.Request) (*scanners.Re
 		}
 		switch {
 		case isDockerfile(file.Rel):
-			data, err := security.ReadFileLimited(file.Abs, req.Config.Limits.MaxFileSize)
+			data, err := security.ReadFileLimitedVerified(file.Abs, file.Info, req.Config.Limits.MaxFileSize)
 			if err != nil {
 				res.Warnings = append(res.Warnings, fmt.Sprintf("%s: could not be read: %v", file.Rel, err))
 				continue
@@ -45,7 +45,7 @@ func (s *Scanner) Scan(ctx context.Context, req *scanners.Request) (*scanners.Re
 			res.Findings = append(res.Findings, checkDockerfile(file.Rel, data)...)
 			counts.docker++
 		case isComposeFile(file.Rel):
-			data, err := security.ReadFileLimited(file.Abs, req.Config.Limits.MaxFileSize)
+			data, err := security.ReadFileLimitedVerified(file.Abs, file.Info, req.Config.Limits.MaxFileSize)
 			if err != nil {
 				res.Warnings = append(res.Warnings, fmt.Sprintf("%s: could not be read: %v", file.Rel, err))
 				continue
@@ -61,12 +61,12 @@ func (s *Scanner) Scan(ctx context.Context, req *scanners.Request) (*scanners.Re
 			}
 			res.Findings = append(res.Findings, found...)
 			counts.compose++
-		case isCommittedEnvFile(file.Rel):
-			res.Findings = append(res.Findings, newConfigFinding(ruleCommittedEnvFile, file.Rel, 1,
-				"file:.env", "tracked environment file: "+path.Base(file.Rel), "Application configuration"))
+		case isEnvironmentFile(file.Rel):
+			res.Findings = append(res.Findings, newConfigFinding(ruleEnvironmentFile, file.Rel, 1,
+				"file:.env", "environment file in the scanned tree (git tracking not verified): "+path.Base(file.Rel), "Application configuration"))
 			counts.env++
 		case isApplicationConfig(file.Rel):
-			data, err := security.ReadFileLimited(file.Abs, req.Config.Limits.MaxFileSize)
+			data, err := security.ReadFileLimitedVerified(file.Abs, file.Info, req.Config.Limits.MaxFileSize)
 			if err != nil {
 				res.Warnings = append(res.Warnings, fmt.Sprintf("%s: could not be read: %v", file.Rel, err))
 				continue
@@ -112,9 +112,13 @@ func isComposeFile(rel string) bool {
 	return false
 }
 
-// isCommittedEnvFile matches real environment files, excluding the sanitised
+// isEnvironmentFile matches real environment files, excluding the sanitised
 // examples that projects are expected to commit.
-func isCommittedEnvFile(rel string) bool {
+//
+// The match is based on the filename alone. A .env file on disk is not
+// evidence that it is Git-tracked: it may be ignored, untracked, or generated
+// locally. The rule and its message are worded accordingly (WL-CFG-020).
+func isEnvironmentFile(rel string) bool {
 	base := strings.ToLower(path.Base(rel))
 	if !strings.HasPrefix(base, ".env") {
 		return false

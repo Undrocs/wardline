@@ -50,6 +50,11 @@ type Rule struct {
 	// ValidateMatch can inspect the surrounding line and submatch offsets when a
 	// decision requires more context than the captured value alone.
 	ValidateMatch func(line string, match []int) bool
+	// ConfidenceForMatch optionally adjusts the confidence of a single match,
+	// for cases where the surrounding context changes how much the match proves
+	// (for example a credential for a loopback database).
+	ConfidenceForMatch func(line []byte, match []int) findings.Confidence
+
 	// FileLevel rules are evaluated once per file against the path and content
 	// instead of line by line.
 	FileLevel bool
@@ -105,8 +110,10 @@ var (
 	// Connection strings.
 	databaseURL = regexp.MustCompile(`(?i)\b(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis(?:s)?|amqp(?:s)?|mssql|clickhouse)://([^:@/\s"'<>]{1,64}):([^@\s"'<>]{1,256})@([A-Za-z0-9._\-]{1,255})(?::[0-9]{1,5})?`)
 	// Generic assignments.
-	genericPassword = regexp.MustCompile(`(?i)\b(?:password|passwd|pwd|db_?pass|db_?password)\s*[:=]\s*["']([^"'\s]{8,128})["']`)
-	genericAPIKey   = regexp.MustCompile(`(?i)\b(?:api[_-]?key|apikey|secret[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?token)\s*[:=]\s*["']([A-Za-z0-9_\-./+=]{16,256})["']`)
+	// The key may be quoted (JSON, TOML, some YAML), so an optional closing
+	// quote is accepted between the key and the separator.
+	genericPassword = regexp.MustCompile(`(?i)\b(?:password|passwd|pwd|db_?pass|db_?password)["']?\s*[:=]\s*["']([^"'\s]{8,128})["']`)
+	genericAPIKey   = regexp.MustCompile(`(?i)\b(?:api[_-]?key|apikey|api[_-]?token|secret[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?token)["']?\s*[:=]\s*["']([A-Za-z0-9_\-./+=]{16,256})["']`)
 	jwtToken        = regexp.MustCompile(`\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b`)
 	// Committed credential files.
 	sensitiveFilenameRule = regexp.MustCompile(`^.*$`)
@@ -326,7 +333,15 @@ func Rules() []*Rule {
 			Severity:    findings.SeverityHigh, Confidence: findings.ConfidenceHigh,
 			Pattern: databaseURL, SecretGroup: 3, MinLength: 4, MaxLength: 256,
 			ValidateMatch: validateDatabaseURL,
-			Keywords:      []string{"postgres://", "postgresql://", "mysql://", "mongodb://", "mongodb+srv://", "redis://", "rediss://", "amqp://", "amqps://", "mssql://", "clickhouse://"},
+			// A loopback or compose-service host is usually a local default, so
+			// the match is reported at low confidence instead of being dropped.
+			ConfidenceForMatch: func(line []byte, match []int) findings.Confidence {
+				if databaseURLIsLocal(line, match) {
+					return findings.ConfidenceLow
+				}
+				return findings.ConfidenceHigh
+			},
+			Keywords: []string{"postgres://", "postgresql://", "mysql://", "mongodb://", "mongodb+srv://", "redis://", "rediss://", "amqp://", "amqps://", "mssql://", "clickhouse://"},
 			// The user part is validated separately so that ${ENV} placeholders
 			// and local development defaults are not reported.
 			AllowPlaceholders: false,
@@ -352,7 +367,7 @@ func Rules() []*Rule {
 			Severity:    findings.SeverityMedium, Confidence: findings.ConfidenceMedium,
 			Pattern: genericAPIKey, SecretGroup: 1, MinLength: 16, MaxLength: 256,
 			Validate:   validateGenericToken,
-			Keywords:   []string{"api_key", "apikey", "secret_key", "access_token", "auth_token", "client_secret", "private_token", "api-key", "secret-key", "access-token", "auth-token", "client-secret", "private-token"},
+			Keywords:   []string{"api_key", "apikey", "api_token", "secret_key", "access_token", "auth_token", "client_secret", "private_token", "api-key", "secret-key", "access-token", "auth-token", "client-secret", "private-token"},
 			MinEntropy: 3.0,
 		},
 		{

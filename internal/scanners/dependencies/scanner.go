@@ -15,6 +15,7 @@ import (
 
 	"github.com/Undrocs/wardline/internal/config"
 	"github.com/Undrocs/wardline/internal/findings"
+	"github.com/Undrocs/wardline/internal/netguard"
 	"github.com/Undrocs/wardline/internal/osv"
 	"github.com/Undrocs/wardline/internal/scanners"
 	"github.com/Undrocs/wardline/internal/security"
@@ -49,12 +50,10 @@ func (s *Scanner) Scan(ctx context.Context, req *scanners.Request) (*scanners.Re
 	res.Scope = fmt.Sprintf("%d resolvable package(s)", len(unique))
 
 	if len(unique) == 0 {
-		if len(res.Skipped) == 0 {
-			res.Skipped = append(res.Skipped, scanners.SkippedCheck{
-				Check:  "dependency manifests",
-				Reason: "no supported manifest or lockfile found (go.mod, go.sum, package-lock.json, npm-shrinkwrap.json)",
-			})
-		}
+		// No manifest is not a coverage gap: there is nothing to look up. It is
+		// recorded as a note so the report still states the scope, but it does
+		// not mark the scan incomplete the way a skipped lookup does.
+		res.Notes = append(res.Notes, "No supported dependency manifest or lockfile was found (go.mod, go.sum, package-lock.json, npm-shrinkwrap.json); there were no dependency coordinates to check.")
 		return res, nil
 	}
 
@@ -68,8 +67,10 @@ func (s *Scanner) Scan(ctx context.Context, req *scanners.Request) (*scanners.Re
 	}
 
 	endpoint := config.DefaultOSVEndpoint
+	policy := netguard.Policy{}
 	if req.Config != nil && strings.TrimSpace(req.Config.Network.OSVEndpoint) != "" {
 		endpoint = req.Config.Network.OSVEndpoint
+		policy = req.Config.EndpointPolicy()
 	}
 	if req.Config != nil && !req.Config.Network.Enabled {
 		res.Skipped = append(res.Skipped, scanners.SkippedCheck{
@@ -82,7 +83,12 @@ func (s *Scanner) Scan(ctx context.Context, req *scanners.Request) (*scanners.Re
 	// Identify the client with its version so OSV operators can attribute
 	// traffic. No repository or user information is included.
 	userAgent := "wardline/" + version.Get().Version
-	options := []osv.Option{osv.WithUserAgent(userAgent)}
+	// The endpoint may come from the scanned repository's configuration, so it
+	// is validated against the approval policy before any request is prepared.
+	if _, err := netguard.Check(endpoint, policy); err != nil {
+		return nil, fmt.Errorf("OSV endpoint rejected: %w", err)
+	}
+	options := []osv.Option{osv.WithUserAgent(userAgent), osv.WithPolicy(policy)}
 	if req.Logf != nil {
 		options = append(options, osv.WithLogger(func(format string, args ...any) { req.Log(format, args...) }))
 	}
@@ -107,11 +113,14 @@ func (s *Scanner) Scan(ctx context.Context, req *scanners.Request) (*scanners.Re
 		if len(results) == 0 {
 			return nil, fmt.Errorf("OSV vulnerability lookup failed: %w; dependency vulnerabilities were not checked", batchErr)
 		}
+		// Name the packages that were never queried: a count alone cannot be
+		// acted on, and these packages must not be read as clean.
+		unchecked := unique[len(results):]
 		res.Skipped = append(res.Skipped, scanners.SkippedCheck{
 			Check:  "OSV vulnerability lookup",
-			Reason: fmt.Sprintf("%d package(s) were not queried: %v", len(unique)-len(results), batchErr),
+			Reason: fmt.Sprintf("%d of %d package(s) were not queried (%s): %v", len(unchecked), len(unique), summarizeNames(unchecked, 8), batchErr),
 		})
-		res.Warnings = append(res.Warnings, "The dependency scan is incomplete; unchecked packages must not be assumed clean.")
+		res.Warnings = append(res.Warnings, "The dependency scan is incomplete; the unqueried packages listed above must not be assumed clean.")
 	}
 
 	// Map results back to packages and collect advisory identifiers.
@@ -148,7 +157,18 @@ func (s *Scanner) Scan(ctx context.Context, req *scanners.Request) (*scanners.Re
 
 	details, detailErrs := client.FetchMany(ctx, ids)
 	if len(detailErrs) > 0 {
-		res.Warnings = append(res.Warnings, fmt.Sprintf("%d advisory detail request(s) failed; affected findings are reported with reduced metadata", len(detailErrs)))
+		// The vulnerability itself was detected, so these findings stay in the
+		// report. Only their metadata is degraded, which is a warning rather
+		// than a coverage gap, and the affected advisories are named so the
+		// report distinguishes them from fully resolved ones.
+		failed := make([]string, 0, len(detailErrs))
+		for id := range detailErrs {
+			failed = append(failed, id)
+		}
+		sort.Strings(failed)
+		res.Warnings = append(res.Warnings, fmt.Sprintf(
+			"%d advisory detail request(s) failed (%s); the affected findings are reported with reduced metadata (identifier, summary and severity may be missing), and their identity and severity were not confirmed by the advisory text",
+			len(failed), summarizeStrings(failed, 8)))
 	}
 
 	for _, h := range hits {
@@ -182,6 +202,7 @@ func (s *Scanner) collectPackages(ctx context.Context, req *scanners.Request) ([
 	}
 	dirs := map[string]*dirInfo{}
 	order := []string{}
+	var workspaceReplaces []goReplace
 
 	for i := range req.Files {
 		file := req.Files[i]
@@ -204,7 +225,7 @@ func (s *Scanner) collectPackages(ctx context.Context, req *scanners.Request) ([
 			f := file
 			info.goMod = &f
 		case kindGoSum:
-			data, err := security.ReadFileLimited(file.Abs, req.Config.Limits.MaxFileSize)
+			data, err := security.ReadFileLimitedVerified(file.Abs, file.Info, req.Config.Limits.MaxFileSize)
 			if err != nil {
 				warnings = append(warnings, fmt.Sprintf("%s: could not be read: %v", file.Rel, err))
 				continue
@@ -214,12 +235,24 @@ func (s *Scanner) collectPackages(ctx context.Context, req *scanners.Request) ([
 			f := file
 			info.lockfile = &f
 		case kindPackageJSON:
-			data, err := security.ReadFileLimited(file.Abs, req.Config.Limits.MaxFileSize)
+			data, err := security.ReadFileLimitedVerified(file.Abs, file.Info, req.Config.Limits.MaxFileSize)
 			if err != nil {
 				warnings = append(warnings, fmt.Sprintf("%s: could not be read: %v", file.Rel, err))
 				continue
 			}
 			info.pkgJSON = data
+		case kindGoWork:
+			data, err := security.ReadFileLimitedVerified(file.Abs, file.Info, req.Config.Limits.MaxFileSize)
+			if err != nil {
+				warnings = append(warnings, fmt.Sprintf("%s: could not be read: %v", file.Rel, err))
+				continue
+			}
+			replaces, uses, warns := parseGoWork(file.Rel, data)
+			workspaceReplaces = append(workspaceReplaces, replaces...)
+			warnings = append(warnings, warns...)
+			if len(uses) > 0 {
+				notes = append(notes, fmt.Sprintf("%s: workspace members %s are resolved through their own go.mod files", file.Rel, strings.Join(uses, ", ")))
+			}
 		}
 	}
 
@@ -238,11 +271,30 @@ func (s *Scanner) collectPackages(ctx context.Context, req *scanners.Request) ([
 			if err != nil {
 				warnings = append(warnings, fmt.Sprintf("%s: could not be read: %v", info.goMod.Rel, err))
 			} else {
-				parsed := parseGoMod(info.goMod.Rel, data)
-				warnings = append(warnings, parsed.Warnings...)
+				modFile, warns := parseGoMod(info.goMod.Rel, data)
+				warnings = append(warnings, warns...)
+				// Replacements from go.work apply to every module in the
+				// workspace, so they are merged with the module's own.
+				resolved, localised, replaceNotes := applyGoReplacements(
+					modFile.Requires,
+					append(append([]goReplace{}, workspaceReplaces...), modFile.Replaces...),
+					modFile.Excludes,
+				)
+				warnings = append(warnings, replaceNotes...)
+				if len(localised) > 0 {
+					names := make([]string, 0, len(localised))
+					for _, pkg := range localised {
+						names = append(names, pkg.Name)
+					}
+					sort.Strings(names)
+					skipped = append(skipped, scanners.SkippedCheck{
+						Check:  "go replace directives",
+						Reason: fmt.Sprintf("%s: %s replaced by a local path; the published version is not what the build uses and was not checked", where, strings.Join(names, ", ")),
+					})
+				}
 				verified := 0
 				sumSet := parseGoSum(info.goSum)
-				for _, pkg := range parsed.Packages {
+				for _, pkg := range resolved {
 					if sumSet[pkg.Name+"@"+pkg.Version] {
 						verified++
 					}
@@ -254,10 +306,10 @@ func (s *Scanner) collectPackages(ctx context.Context, req *scanners.Request) ([
 						Check:  "go.sum verification",
 						Reason: fmt.Sprintf("%s: go.sum not found; resolved module versions could not be corroborated (the go.mod module graph was still scanned)", where),
 					})
-				case verified < len(parsed.Packages):
+				case verified < len(resolved):
 					skipped = append(skipped, scanners.SkippedCheck{
 						Check:  "go.sum verification",
-						Reason: fmt.Sprintf("%s: %d of %d go.mod requirements are absent from go.sum and may not be part of the build", where, len(parsed.Packages)-verified, len(parsed.Packages)),
+						Reason: fmt.Sprintf("%s: %d of %d go.mod requirements are absent from go.sum and may not be part of the build", where, len(resolved)-verified, len(resolved)),
 					})
 				}
 			}
@@ -355,8 +407,8 @@ func toView(vuln *osv.Vulnerability, fallbackID string, pkg Package) *vulnerabil
 			view.IDs = append(view.IDs, alias)
 		}
 	}
-	view.Summary = security.SanitizeEvidence(vuln.Summary, 300)
-	view.Details = security.SanitizeEvidence(vuln.Details, 600)
+	view.Summary = security.RedactEvidence(vuln.Summary, 300)
+	view.Details = security.RedactEvidence(vuln.Details, 600)
 	view.DatabaseSeverity = vuln.DatabaseSpecific.Severity
 	for _, s := range vuln.Severity {
 		view.Vectors = append(view.Vectors, struct{ Score string }{Score: s.Score})
@@ -446,4 +498,26 @@ func evidenceFor(pkg Package) string {
 		kind += ", development"
 	}
 	return fmt.Sprintf("%s %s (%s)", pkg.Name, pkg.Version, kind)
+}
+
+// summarizeNames renders package names for a human-readable report, bounded so
+// a large failure cannot flood the console.
+func summarizeNames(pkgs []Package, limit int) string {
+	names := make([]string, 0, len(pkgs))
+	for _, p := range pkgs {
+		names = append(names, p.Name+"@"+p.Version)
+	}
+	return summarizeStrings(names, limit)
+}
+
+// summarizeStrings joins values, truncating to limit entries with a count of
+// the remainder.
+func summarizeStrings(values []string, limit int) string {
+	if len(values) == 0 {
+		return "none"
+	}
+	if len(values) <= limit {
+		return strings.Join(values, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(values[:limit], ", "), len(values)-limit)
 }

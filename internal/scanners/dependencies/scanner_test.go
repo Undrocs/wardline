@@ -20,17 +20,24 @@ import (
 
 // osvMock is a deterministic stand-in for the OSV.dev API.
 type osvMock struct {
-	t            *testing.T
-	server       *httptest.Server
-	batchCalls   int32
-	detailCalls  int32
-	failBatch    int32 // number of remaining batch requests to fail
-	failDetail   bool
-	queryCount   int
-	lastQueries  []map[string]any
-	userAgents   []string
-	vulns        map[string]map[string]any
-	queryResults map[string][]string // "ecosystem/name@version" -> vuln ids
+	t           *testing.T
+	server      *httptest.Server
+	batchCalls  int32
+	detailCalls int32
+	failBatch   int32 // number of remaining batch requests to fail
+	// batchFailFrom makes every batch call with a 1-based index >= this value
+	// fail with batchFailStatus, which models a chunked lookup that dies
+	// part-way through.
+	batchFailFrom   int32
+	batchFailStatus int32
+	// malformedBatch returns a syntactically valid but incomplete response.
+	malformedBatch bool
+	failDetail     bool
+	queryCount     int
+	lastQueries    []map[string]any
+	userAgents     []string
+	vulns          map[string]map[string]any
+	queryResults   map[string][]string // "ecosystem/name@version" -> vuln ids
 }
 
 func newOSVMock(t *testing.T) *osvMock {
@@ -45,6 +52,19 @@ func newOSVMock(t *testing.T) *osvMock {
 		m.userAgents = append(m.userAgents, r.Header.Get("User-Agent"))
 		if atomic.AddInt32(&m.failBatch, -1) >= 0 {
 			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if from := atomic.LoadInt32(&m.batchFailFrom); from > 0 && atomic.LoadInt32(&m.batchCalls) >= from {
+			status := int(atomic.LoadInt32(&m.batchFailStatus))
+			if status == 0 {
+				status = http.StatusServiceUnavailable
+			}
+			http.Error(w, "chunk failed", status)
+			return
+		}
+		if m.malformedBatch {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"results": []}`))
 			return
 		}
 		if r.Method != http.MethodPost {
@@ -121,6 +141,9 @@ func scanDependencies(t *testing.T, dir, endpoint string, offline bool) *scanner
 	t.Helper()
 	cfg := config.Default()
 	cfg.Network.OSVEndpoint = endpoint
+	// The mock listens on loopback, which the default policy refuses; approving
+	// it mirrors what --allow-custom-endpoint does for a real internal mirror.
+	cfg.Network.AllowCustomEndpoint = true
 	var files []scanners.File
 	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -303,8 +326,13 @@ func TestScanWithoutManifests(t *testing.T) {
 	dir := t.TempDir()
 	writeDependencyFile(t, dir, "README.md", "hello")
 	res := scanDependencies(t, dir, "http://127.0.0.1:1", false)
-	if len(res.Skipped) != 1 {
-		t.Fatalf("expected one skipped check, got %+v", res.Skipped)
+	// No manifest means there is nothing to look up, which is a scope statement,
+	// not a coverage gap: it must not mark the scan incomplete.
+	if len(res.Skipped) != 0 {
+		t.Fatalf("no manifest should not be a skipped check, got %+v", res.Skipped)
+	}
+	if !strings.Contains(strings.Join(res.Notes, " "), "No supported dependency manifest") {
+		t.Fatalf("the scope statement is missing from the notes: %v", res.Notes)
 	}
 }
 
@@ -345,6 +373,7 @@ func TestBatchFailureIsAnError(t *testing.T) {
 	writeDependencyFile(t, dir, "go.sum", goSumFixture)
 	cfg := config.Default()
 	cfg.Network.OSVEndpoint = mock.endpoint()
+	cfg.Network.AllowCustomEndpoint = true
 	path := filepath.Join(dir, "go.mod")
 	info, err := os.Stat(path)
 	if err != nil {
@@ -447,6 +476,7 @@ func TestCancellationIsPropagated(t *testing.T) {
 	writeDependencyFile(t, dir, "go.sum", goSumFixture)
 	cfg := config.Default()
 	cfg.Network.OSVEndpoint = "http://127.0.0.1:1"
+	cfg.Network.AllowCustomEndpoint = true
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	path := filepath.Join(dir, "go.mod")
@@ -465,4 +495,135 @@ func skippedReasons(res *scanners.Result) []string {
 		out = append(out, s.Check+": "+s.Reason)
 	}
 	return out
+}
+
+// requestFor builds a scan request over dir with a custom OSV endpoint that the
+// policy explicitly approves.
+func requestFor(t *testing.T, dir, endpoint string) *scanners.Request {
+	t.Helper()
+	cfg := config.Default()
+	cfg.Network.OSVEndpoint = endpoint
+	cfg.Network.AllowCustomEndpoint = true
+	var files []scanners.File
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			return infoErr
+		}
+		rel, relErr := filepath.Rel(dir, p)
+		if relErr != nil {
+			return relErr
+		}
+		files = append(files, scanners.File{Rel: filepath.ToSlash(rel), Abs: p, Size: info.Size(), Info: info})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &scanners.Request{
+		Root: dir, Config: cfg, Now: time.Unix(1700000000, 0), Files: files,
+		HTTPClient: &http.Client{Timeout: 2 * time.Second},
+	}
+}
+
+// manyPackageFixture writes a go.mod/go.sum pair with n dependencies so a
+// lookup can be split across several batches.
+func manyPackageFixture(t *testing.T, dir string, n int) {
+	t.Helper()
+	var b, sum strings.Builder
+	b.WriteString("module example.com/app\n\ngo 1.21\n\nrequire (\n")
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("example.com/dep%04d", i)
+		b.WriteString("\t" + name + " v1.0.0\n")
+		sum.WriteString(name + " v1.0.0 h1:x=\n")
+	}
+	b.WriteString(")\n")
+	writeDependencyFile(t, dir, "go.mod", b.String())
+	writeDependencyFile(t, dir, "go.sum", sum.String())
+}
+
+func TestPartialBatchFailureNamesUncheckedPackages(t *testing.T) {
+	mock := newOSVMock(t)
+	// The first batch (500 queries) succeeds, the second fails permanently.
+	atomic.StoreInt32(&mock.batchFailFrom, 2)
+	dir := t.TempDir()
+	manyPackageFixture(t, dir, 1200)
+
+	res := scanDependencies(t, dir, mock.endpoint(), false)
+	if len(res.Skipped) == 0 {
+		t.Fatal("a partial lookup must be reported as a skipped check")
+	}
+	reasons := strings.Join(skippedReasons(res), " ")
+	for _, want := range []string{"700 of 1200 package(s) were not queried", "example.com/dep0500", "and 692 more"} {
+		if !strings.Contains(reasons, want) {
+			t.Errorf("skip reason is missing %q: %s", want, reasons)
+		}
+	}
+	if !strings.Contains(strings.Join(res.Warnings, " "), "must not be assumed clean") {
+		t.Errorf("expected an explicit warning about unchecked packages: %v", res.Warnings)
+	}
+	// The packages that were checked keep their results.
+	if !strings.Contains(res.Scope, "500 of 1200") {
+		t.Errorf("scope must state how many packages were checked, got %q", res.Scope)
+	}
+}
+
+func TestRateLimitedLookupIsReported(t *testing.T) {
+	mock := newOSVMock(t)
+	atomic.StoreInt32(&mock.batchFailFrom, 1)
+	atomic.StoreInt32(&mock.batchFailStatus, http.StatusTooManyRequests)
+	dir := t.TempDir()
+	manyPackageFixture(t, dir, 3)
+
+	_, err := New().Scan(context.Background(), requestFor(t, dir, mock.endpoint()))
+	if err == nil {
+		t.Fatal("a rate-limited lookup must fail, not report a clean result")
+	}
+	if !strings.Contains(err.Error(), "rate limited") {
+		t.Errorf("the error should identify rate limiting: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not checked") {
+		t.Errorf("the error should state that dependencies were not checked: %v", err)
+	}
+}
+
+func TestMalformedBatchResponseIsRejected(t *testing.T) {
+	mock := newOSVMock(t)
+	mock.malformedBatch = true
+	dir := t.TempDir()
+	manyPackageFixture(t, dir, 3)
+
+	_, err := New().Scan(context.Background(), requestFor(t, dir, mock.endpoint()))
+	if err == nil {
+		t.Fatal("a response with fewer results than queries must be rejected")
+	}
+	if !strings.Contains(err.Error(), "cannot be trusted") {
+		t.Errorf("the error should explain why the response was rejected: %v", err)
+	}
+}
+
+func TestDetailFailureIsNotACoverageGap(t *testing.T) {
+	mock := newOSVMock(t)
+	mock.failDetail = true
+	mock.queryResults["Go/example.com/dep0000@v1.0.0"] = []string{"GHSA-detail-gap"}
+	dir := t.TempDir()
+	manyPackageFixture(t, dir, 2)
+
+	res := scanDependencies(t, dir, mock.endpoint(), false)
+	if len(res.Skipped) != 0 {
+		t.Fatalf("a failed advisory detail request is a metadata gap, not an unchecked package: %v", skippedReasons(res))
+	}
+	if len(res.Findings) != 1 {
+		t.Fatalf("the detected vulnerability must still be reported: %+v", res.Findings)
+	}
+	joined := strings.Join(res.Warnings, " ")
+	if !strings.Contains(joined, "GHSA-detail-gap") {
+		t.Errorf("the degraded advisory should be named: %s", joined)
+	}
+	if !strings.Contains(joined, "reduced metadata") {
+		t.Errorf("the warning should say the metadata is reduced: %s", joined)
+	}
 }

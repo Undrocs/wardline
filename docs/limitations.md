@@ -14,12 +14,19 @@ this MVP build. Read it before relying on a scan result.
   inspection and simple heuristics. There is no data-flow or taint analysis, no
   type inference and no symbolic execution. Obfuscated, encoded, split or
   dynamically constructed secrets and vulnerabilities are missed.
-- **Local development values are not reported as exposed secrets.**
-  Connection strings that point at `localhost`, `127.0.0.1` or a `.example`
-  host are treated as development configuration, and placeholder values
-  (`changeme`, `your-api-key`, `${VAR}`, repeated characters) are skipped. This
-  keeps the signal usable but means a real credential aimed at a local service
-  can be missed.
+- **Local development values are reported at low confidence.** A connection
+  string whose host is `localhost`, `127.0.0.1` or a Compose service name is
+  reported (the password is still a credential) with confidence `low`, and
+  `--min-confidence medium` hides it. `.example`, `.invalid` and documentation
+  placeholders (`changeme`, `your-api-key`, `${VAR}`, repeated characters) are
+  still skipped, as are values where a placeholder word such as `fake` or
+  `dummy` stands alone; a real token that merely contains those letters is
+  reported.
+- **Some literal shapes are still missed.** Generic key/value detection needs a
+  quoted value: `config.password = "…"` is caught, `config.password = variable`
+  is not (and cannot be told apart from ordinary code). YAML block scalars whose
+  value is not a single line, values assembled at runtime from several literals,
+  and credentials in formats with no recognisable key name remain invisible.
 - **No exploitability analysis.** A reported dependency vulnerability is a
   version match against an advisory. Wardline does not determine whether the
   vulnerable function is reachable from your code.
@@ -52,6 +59,13 @@ this MVP build. Read it before relying on a scan result.
   per-file decision; skipped oversized files, unreadable paths and directory
   trees deeper than 64 levels additionally mark the scan incomplete, because
   unexamined content must never be reported as clean.
+- The secret scanner bounds its work per file: a single line longer than 8 KiB
+  is only partially searched, more than 8 matches on one line and more than 100
+  findings in one file stop further matching. Each of those cases is recorded as
+  a skipped check, so the report says *partial* instead of *clean*.
+- `--fail-incomplete` turns any of these conditions into exit code `3`. CI
+  should use it together with `--strict`; without it an incomplete scan can
+  still exit `0`, and the report is the only place that says so.
 
 ## Dependencies
 
@@ -60,12 +74,28 @@ this MVP build. Read it before relying on a scan result.
   `package-lock.json` or `npm-shrinkwrap.json` (v1/v2/v3 layouts supported).
   Without a lockfile the npm scanner reports a skipped check instead of guessing
   versions from a semver range.
+- **Go replacements are resolved, but not always checkable.** `replace`
+  directives (version bump, module swap, local path) and `exclude` directives in
+  `go.mod`, and `replace`/`use` in `go.work`, are applied before lookup, so the
+  versions reported are the ones a build would use. A module replaced by a local
+  directory has no published version to query: it is listed as a skipped check
+  and its contents are not audited.
+- **Newer lockfile formats are refused.** `lockfileVersion` above 3 is reported
+  as an error for that file instead of being parsed on a best-effort basis, and
+  entries that resolve to git, `file:` or workspace sources are skipped and
+  listed. A dependency declared in `package.json` but missing from the lockfile
+  is reported as a stale lockfile.
 - Vendored directories and `node_modules` are excluded. A committed
   `node_modules` tree is not audited package by package.
 - Only Go and npm ecosystems are queried. Python, Ruby, Rust, Java and other
   ecosystems are out of scope for this MVP and are not silently assumed safe:
   they are simply not inventoried, and the scanner scope line states what was
   checked.
+- **A failed lookup is not a clean result.** A dependency batch that fails
+  part-way keeps the packages already checked, names the packages that were
+  never queried and marks the scan incomplete. A failed advisory *detail*
+  request keeps the finding (the vulnerability was detected) with reduced
+  metadata and is reported separately.
 - OSV results are advisory data. Severity is `unknown` when an advisory
   publishes neither a database-specific severity nor a CVSS v3 vector. CVSS v4
   vectors are not converted; such advisories remain `unknown` rather than being

@@ -48,8 +48,11 @@ func WriteMarkdown(w io.Writer, rep *Report) error {
 	fmt.Fprintf(&b, "## Scanners\n\n")
 	fmt.Fprintf(&b, "| Scanner | Status | Scope | Findings |\n|---|---|---|---:|\n")
 	for _, run := range rep.Scanners {
-		fmt.Fprintf(&b, "| %s | %s | %s | %d |\n",
-			run.Name, run.Status, escapeCell(orDefault(run.Scope, "—")), run.Findings)
+		status := string(run.Status)
+		if run.Disabled {
+			status = "disabled"
+		}
+		fmt.Fprintf(&b, "| %s | %s | %s | %d |\n", run.Name, status, escapeCell(orDefault(run.Scope, "—")), run.Findings)
 	}
 	fmt.Fprintf(&b, "\n")
 	if rep.Summary.Incomplete {
@@ -74,8 +77,19 @@ func WriteMarkdown(w io.Writer, rep *Report) error {
 		fmt.Fprintf(&b, "\n")
 	}
 
+	if len(rep.PolicyNotices) > 0 {
+		fmt.Fprintf(&b, "## Policy notices\n\n")
+		for _, notice := range rep.PolicyNotices {
+			fmt.Fprintf(&b, "- %s\n", notice)
+		}
+		fmt.Fprintf(&b, "\n")
+	}
+
 	var skipped []string
 	for _, run := range rep.Scanners {
+		if run.Disabled {
+			continue
+		}
 		for _, sk := range run.Skipped {
 			skipped = append(skipped, fmt.Sprintf("`%s` — %s: %s", sk.Check, run.Name, sk.Reason))
 		}

@@ -150,6 +150,7 @@ func WriteSARIF(w io.Writer, rep *Report) error {
 			"filesScanned":        rep.Scan.Files,
 			"configFile":          rep.Scan.ConfigFile,
 			"incomplete":          rep.Summary.Incomplete,
+			"policyNotices":       rep.PolicyNotices,
 			"networkDestinations": rep.Network.Destinations,
 		},
 	}
@@ -245,6 +246,12 @@ func WriteSARIF(w io.Writer, rep *Report) error {
 	}
 
 	invocation := sarifInvocation{ExecutionSuccessful: len(rep.Errors) == 0}
+	for _, notice := range rep.PolicyNotices {
+		invocation.ToolExecutionNotifications = append(invocation.ToolExecutionNotifications, sarifNotification{
+			Level:   "note",
+			Message: sarifMessage{Text: notice},
+		})
+	}
 	for _, e := range rep.Errors {
 		invocation.ToolExecutionNotifications = append(invocation.ToolExecutionNotifications, sarifNotification{
 			Level:   "error",
@@ -252,6 +259,13 @@ func WriteSARIF(w io.Writer, rep *Report) error {
 		})
 	}
 	for _, runInfo := range rep.Scanners {
+		if runInfo.Disabled {
+			invocation.ToolExecutionNotifications = append(invocation.ToolExecutionNotifications, sarifNotification{
+				Level:   "note",
+				Message: sarifMessage{Text: runInfo.Name + " scanner disabled: it did not run for this scan"},
+			})
+			continue
+		}
 		if runInfo.Status == "skipped" || runInfo.Status == "partial" || runInfo.Status == "failed" {
 			notifications := make([]string, 0, len(runInfo.Skipped))
 			for _, sk := range runInfo.Skipped {

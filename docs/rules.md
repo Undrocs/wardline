@@ -70,10 +70,15 @@ Notes:
   credential but identifies a rotation target.
 - `WL-SEC-020` reports only the key header (`private key block: -----BEGIN …`)
   and never any base64 key material.
+- `WL-SEC-021` reports a database URI with an embedded password. A loopback or
+  Compose-service host (`localhost`, `127.0.0.1`, `db`, `redis`, …) lowers the
+  confidence to `low` instead of suppressing the finding.
 - `WL-SEC-022`/`WL-SEC-023` require a credential-like key name **and** a
-  literal value; references to environment variables, template placeholders
-  (`${…}`, `{{…}}`), obvious placeholders (`changeme`, `example`, `password`),
-  and strings below a minimum entropy are not reported.
+  quoted literal value; references to environment variables, template
+  placeholders (`${…}`, `{{…}}`), obvious placeholders (`changeme`, `example`,
+  `password`), and strings below a minimum entropy are not reported. Both rules
+  understand quoted keys (`"password": "…"`, `"api_key" = "…"`) and YAML block
+  scalars (`password: |` followed by an indented literal).
 - `WL-SEC-025` fires once per credential-bearing filename (for example
   `id_rsa`, `.netrc`, `.aws/credentials`), regardless of content.
 - Test and documentation fixtures: find the pattern, not a live credential;
@@ -147,11 +152,17 @@ data passed through `env:` (never interpolated directly into `run:`), and
 | `WL-CFG-015` | Sensitive host path mounted into container | medium | medium | Compose: bind mount of `/`, `/etc`, `/root`, `/home`, `/var/run`, … |
 | `WL-CFG-016` | Container explicitly runs as root | low | high | Compose: `user: root` / `user: "0"`. |
 | `WL-CFG-017` | Sensitive service port published on all interfaces | medium | medium | Compose: database/cache port published without a host IP. |
-| `WL-CFG-020` | Environment file committed to the repository | medium | medium | A tracked `.env` file (templates such as `.env.example` are ignored). |
+| `WL-CFG-020` | Environment file present in the scanned tree | medium | medium | A `.env` file exists in the working tree (templates such as `.env.example` are ignored). Wardline does not run Git, so it cannot tell whether the file is tracked: the remediation tells you how to check. |
 | `WL-CFG-021` | TLS certificate verification disabled | medium | medium | YAML/JSON application config: `InsecureSkipVerify`, `verify=False`, `rejectUnauthorized: false`, … |
 
 The configuration scanner only reports what static inspection can establish. It
 never builds an image, starts Compose, or evaluates shell expressions.
+
+Evidence in configuration files is excerpted from untrusted build files.
+Dockerfile `RUN`, `ADD` and `COPY` arguments, Compose values and workflow
+commands are redacted with `security.RedactEvidence` before they are stored, so a
+credential in a `curl -H "Authorization: Bearer …"` line never reaches a report.
+Truncation happens after redaction for the same reason.
 
 ## Overlapping findings
 

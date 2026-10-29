@@ -249,14 +249,25 @@ func TestMalformedComposeIsSkipped(t *testing.T) {
 	}
 }
 
-func TestCommittedEnvFile(t *testing.T) {
-	res := scanFile(t, "deploy/.env.production", "DB_HOST=db.internal\n")
-	if !hasRule(res, "WL-CFG-020") {
-		t.Fatalf("expected WL-CFG-020, got %v", findingRuleIDs(res))
+func TestEnvironmentFileIsReportedWithoutTrackingClaims(t *testing.T) {
+	for _, rel := range []string{"deploy/.env.production", ".env", ".env.local", ".env.test", ".env.ci"} {
+		res := scanFile(t, rel, "DB_HOST=db.internal\n")
+		if !hasRule(res, "WL-CFG-020") {
+			t.Fatalf("%s: expected WL-CFG-020, got %v", rel, findingRuleIDs(res))
+		}
+		msg := strings.ToLower(res.Findings[0].Title + " " + res.Findings[0].Description + " " + res.Findings[0].Evidence)
+		if strings.Contains(msg, "tracked environment file") || strings.Contains(msg, "committed to the repository") {
+			t.Fatalf("%s: the finding still claims the file is tracked: %q", rel, msg)
+		}
+		if !strings.Contains(msg, "not verified") {
+			t.Fatalf("%s: the finding must disclose that Git tracking was not checked: %q", rel, msg)
+		}
 	}
-	res = scanFile(t, ".env.example", "DB_HOST=db.internal\n")
-	if hasRule(res, "WL-CFG-020") {
-		t.Fatal("example env files must not be reported")
+	for _, rel := range []string{".env.example", ".env.sample", ".env.template", ".env.dist"} {
+		res := scanFile(t, rel, "DB_HOST=db.internal\n")
+		if hasRule(res, "WL-CFG-020") {
+			t.Fatalf("%s: example env files must not be reported", rel)
+		}
 	}
 }
 

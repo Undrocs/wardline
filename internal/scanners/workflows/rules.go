@@ -563,24 +563,27 @@ func looksLikeSecretEcho(line string) bool {
 	return false
 }
 
+// truncateForEvidence prepares untrusted workflow text for storage.
+//
+// Redaction happens before truncation: shortening first can cut a credential
+// (or the '@' of a URL userinfo section) so that it no longer matches a
+// redaction pattern, leaving the visible remainder unredacted.
 func truncateForEvidence(s string, max int) string {
-	s = strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", " ")
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "…"
+	return security.RedactEvidence(s, max)
 }
 
 // newFinding builds a workflow finding with a stable structural locator.
 func newFinding(r rule, file string, line int, locator, evidence string) findings.Finding {
 	return findings.New(findings.Finding{
-		RuleID:      r.ID,
-		Scanner:     findings.ScannerWorkflows,
-		Title:       r.Title,
-		Severity:    r.Severity,
-		Confidence:  r.Confidence,
-		Location:    findings.Location{Path: file, StartLine: line},
-		Evidence:    security.SanitizeEvidence(evidence, 200),
+		RuleID:     r.ID,
+		Scanner:    findings.ScannerWorkflows,
+		Title:      r.Title,
+		Severity:   r.Severity,
+		Confidence: r.Confidence,
+		Location:   findings.Location{Path: file, StartLine: line},
+		// Run scripts, `uses` references and runner labels are untrusted input;
+		// a command line can carry a token in a URL or an argument.
+		Evidence:    security.RedactEvidence(evidence, 200),
 		Description: r.Description,
 		Impact:      r.Impact,
 		Remediation: r.Remediation,

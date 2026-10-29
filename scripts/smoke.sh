@@ -49,6 +49,11 @@ expect "clean fixture passes" 0 "$binary" scan testdata/clean --offline --no-col
 expect "vulnerable fixture fails policy" 1 "$binary" scan "$vuln" --offline --no-color
 expect "audit secrets fails policy" 1 "$binary" audit secrets "$vuln" --offline --no-color
 expect "sarif output" 1 "$binary" scan "$vuln" --offline --format sarif --output "$tmp/report.sarif"
+# Audit-policy flags: a strict scan of the vulnerable fixture still fails, and an
+# incomplete scan can be turned into an operational failure.
+expect "strict scan of the vulnerable fixture fails policy" 1 "$binary" scan "$vuln" --offline --no-color --strict
+expect "fail-incomplete turns partial coverage into exit 3" 3 "$binary" scan testdata/clean --offline --no-color --fail-incomplete
+expect "offline scan without fail-incomplete still succeeds" 0 "$binary" scan testdata/clean --offline --no-color
 
 # Reports must never contain a raw fixture credential.
 if grep -q "sk_live_" "$tmp/report.sarif"; then

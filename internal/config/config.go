@@ -18,6 +18,7 @@ import (
 	"github.com/goccy/go-yaml"
 
 	"github.com/Undrocs/wardline/internal/findings"
+	"github.com/Undrocs/wardline/internal/netguard"
 	"github.com/Undrocs/wardline/internal/security"
 )
 
@@ -63,6 +64,25 @@ type Limits struct {
 type Network struct {
 	Enabled     bool   `yaml:"enabled" json:"enabled"`
 	OSVEndpoint string `yaml:"osvEndpoint" json:"osvEndpoint"`
+	// AllowCustomEndpoint records whether the operator approved the configured
+	// endpoint. It is never read from the configuration file: a repository
+	// cannot approve its own endpoint. Only the command line flag
+	// (--allow-custom-endpoint) or a calling API sets it, and the official
+	// endpoint never needs approval.
+	AllowCustomEndpoint bool `yaml:"-" json:"allowCustomEndpoint"`
+}
+
+// RequiresEndpointApproval reports whether the configured endpoint is a custom
+// one that the operator has not approved.
+func (c *Config) RequiresEndpointApproval() bool {
+	return !netguard.IsOfficial(c.Network.OSVEndpoint) && !c.Network.AllowCustomEndpoint
+}
+
+// EndpointPolicy returns the outbound network policy implied by the
+// configuration. It is used to build the HTTP client and passed to the
+// dependency scanner so both enforce the same rules.
+func (c *Config) EndpointPolicy() netguard.Policy {
+	return netguard.Policy{AllowCustomEndpoint: c.Network.AllowCustomEndpoint}
 }
 
 // Timeouts bounds scan duration and HTTP requests.
@@ -305,13 +325,16 @@ func Parse(data []byte) (*Config, error) {
 			cfg.Network.Enabled = *raw.Network.Enabled
 		}
 		if raw.Network.OSVEndpoint != nil {
-			endpoint := strings.TrimSpace(*raw.Network.OSVEndpoint)
-			if endpoint == "" {
-				add("network.osvEndpoint: must not be empty")
-			} else if !strings.HasPrefix(endpoint, "https://") && !strings.HasPrefix(endpoint, "http://") {
-				add("network.osvEndpoint: %q must be an http(s) URL", endpoint)
+			// Approved here only means "structurally valid": the endpoint is
+			// parsed with the permissive policy and the approval decision is made
+			// by the caller (CLI flag or API), because the file being parsed may
+			// come from the repository under scan. Metadata addresses, embedded
+			// credentials and non-HTTP schemes are rejected outright.
+			endpoint, err := netguard.Check(*raw.Network.OSVEndpoint, netguard.Policy{AllowCustomEndpoint: true})
+			if err != nil {
+				add("network.osvEndpoint: %v", err)
 			} else {
-				cfg.Network.OSVEndpoint = strings.TrimRight(endpoint, "/")
+				cfg.Network.OSVEndpoint = endpoint
 			}
 		}
 	}

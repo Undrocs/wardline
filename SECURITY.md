@@ -63,6 +63,9 @@ you informed of progress in the advisory.
   network.
 - Outbound transmission of repository content beyond the documented package
   coordinates sent to the OSV endpoint.
+- Any way to make Wardline contact a destination other than the approved OSV
+  endpoint — a crafted `.wardline.yaml`, a redirect, DNS rebinding, or a
+  proxy that the policy does not account for.
 - Code execution, command injection or script execution triggered by a scanned
   repository (workflows, Dockerfiles, lockfiles, configuration).
 - Path traversal, symlink escape, or reads outside the scan root.
@@ -96,11 +99,23 @@ security regression:
 3. Read-only access to the target. No writes, deletes or renames inside a
    scanned repository.
 4. No network activity except the documented OSV query, and none at all with
-   `--offline` or `network.enabled: false`.
+   `--offline` or `network.enabled: false`. The destination is decided by
+   `internal/netguard`: official HTTPS endpoint by default, custom endpoints only
+   with explicit operator approval, never loopback/private/link-local/metadata
+   addresses, redirects re-validated, and the dialled IP checked again at connect
+   time.
 5. No telemetry, no analytics, no crash upload.
 6. Failed, partial or skipped checks must never be reported as clean; the
    corresponding exit code and `summary.incomplete` must reflect reality.
-7. Report files are created with mode `0600` and contain repository-relative
-   paths only.
+7. Report files are created with mode `0600`, written to a temporary file and
+   atomically renamed, refuse symlink or non-regular destinations, and contain
+   repository-relative paths only (an absolute target is reduced to a basename,
+   `<home directory>` or `<absolute path>`).
+8. A scanned repository cannot weaken its own audit: `--strict` neutralises
+   disabled scanners, suppressions and lowered thresholds and reports every
+   override, and `--fail-incomplete` turns partial coverage into exit code `3`.
+9. Scanned files are re-validated at read time (`O_NOFOLLOW` where available,
+   inode identity and size compared with the walk) so a concurrent replacement
+   cannot substitute the file that is scanned.
 
 See [docs/threat-model.md](docs/threat-model.md) for the full model.
