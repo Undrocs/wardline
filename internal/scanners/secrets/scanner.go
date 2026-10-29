@@ -7,7 +7,6 @@ package secrets
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"path"
 	"regexp"
@@ -181,7 +180,7 @@ func (s *Scanner) scanFile(ctx context.Context, req *scanners.Request, file scan
 		}
 	}
 
-	seen := make(map[[32]byte]bool)
+	seen := make(map[string]bool)
 	lines := splitLines(content)
 	for idx, raw := range lines {
 		if ctx.Err() != nil {
@@ -225,11 +224,12 @@ func (s *Scanner) scanFile(ctx context.Context, req *scanners.Request, file scan
 					if !ok {
 						continue
 					}
-					key := sha256.Sum256([]byte(rule.ID + "\x00" + f.Locator))
-					if seen[key] {
+					// f.ID already covers rule, path and locator, so it is the
+					// dedupe key: no second hash is needed.
+					if seen[f.ID] {
 						continue
 					}
-					seen[key] = true
+					seen[f.ID] = true
 					out = append(out, f)
 				}
 			}
@@ -237,9 +237,8 @@ func (s *Scanner) scanFile(ctx context.Context, req *scanners.Request, file scan
 		// A YAML/Ansible style block scalar puts the value on the following
 		// indented line, where no assignment pattern can see it.
 		if f, ok := s.blockScalarFinding(file.Rel, lines, idx); ok {
-			key := sha256.Sum256([]byte(f.RuleID + "\x00" + f.Locator))
-			if !seen[key] {
-				seen[key] = true
+			if !seen[f.ID] {
+				seen[f.ID] = true
 				out = append(out, f)
 			}
 		}

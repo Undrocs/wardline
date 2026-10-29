@@ -80,7 +80,10 @@ No version has been released. There are no tags, binaries or checksums yet;
   weekly schedule, and `dependency-review-action` on pull requests. Every action
   is pinned to a full commit SHA and permissions are per job. The self-scan job
   additionally runs `--strict` with command-line exclusions and asserts that the
-  ignored configuration is reported.
+  ignored configuration is reported. CodeQL runs the `security-extended` pack
+  with one documented query exclusion (`.github/codeql/codeql-config.yml`):
+  `go/weak-sensitive-data-hashing` fires on the finding fingerprint, which hashes
+  an already-masked locator and is never used to protect a credential.
 - **Strict CI policy** — `--strict` resolves repository configuration, applies a
   CI floor and reports every override it neutralised.
 

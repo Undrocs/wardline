@@ -59,7 +59,11 @@ name and an unsafe tag.
 `.github/workflows/ci.yml` runs formatting, vet, `go mod tidy` verification,
 tests on Linux/macOS/Windows, the race detector, a time-boxed fuzz pass, the
 smoke script, the self-scan and the release-packaging check.
-`.github/workflows/security.yml` runs CodeQL, `govulncheck` and dependency review.
+`.github/workflows/security.yml` runs CodeQL (with
+`.github/codeql/codeql-config.yml`), `govulncheck` and dependency review.
+Dependency review needs GitHub's dependency graph, which is a repository setting
+outside the workflow's control; until it is enabled the job reports the
+limitation rather than blocking pull requests.
 Actions are pinned to full commit SHAs; add a new action only with its full SHA
 and a version comment.
 

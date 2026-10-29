@@ -1,0 +1,25 @@
+# CodeQL configuration for Wardline.
+#
+# The only query excluded here is `go/weak-sensitive-data-hashing`. It fires when
+# a variable whose name suggests credential material flows into a hash function
+# such as SHA-256. In this codebase that value is never a credential and the
+# digest never protects one:
+#
+#   - internal/findings.Fingerprint hashes a *locator*. For an inline secret the
+#     locator is the already-masked token (`match:ghp_••••••uG8i`), produced by
+#     security.MaskSecret; the raw value never reaches it.
+#   - The digest is a stable identifier used for de-duplication, SARIF
+#     partialFingerprints and baseline comparison. It is not a password hash, is
+#     never compared to a user-supplied value, and never grants access.
+#
+# Every other CodeQL query, including the security-extended pack, stays enabled.
+# If a future change hashes real credential material for any security purpose,
+# this exclusion must be removed and the code fixed instead.
+name: "Wardline CodeQL configuration"
+queries:
+  - uses: security-extended
+query-filters:
+  - exclude:
+      id: go/weak-sensitive-data-hashing
+paths-ignore:
+  - testdata
