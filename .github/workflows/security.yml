@@ -82,13 +82,15 @@ jobs:
           cache: true
 
       # The tool version is pinned so a compromised or broken release cannot
-      # change what CI runs. It is installed outside the module graph, so go.mod
-      # and go.sum are untouched.
+      # change what CI runs, and it is installed outside the module graph, so
+      # go.mod and go.sum are untouched. It must be a release whose x/tools
+      # understands the syntax of the current Go: v1.1.4 crashed with
+      # "unexpected expr: *ast.KeyValueExpr" on Go 1.27 while building SSA.
       - name: Run govulncheck
         shell: bash
         run: |
           set +e
-          out="$(go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./... 2>&1)"
+          out="$(go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./... 2>&1)"
           status=$?
           {
             echo "### govulncheck"
