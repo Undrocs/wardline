@@ -97,10 +97,11 @@ jobs:
             echo '```'
           } >>"${GITHUB_STEP_SUMMARY}"
           if [ "${status}" -ne 0 ]; then
-            # Surface the actionable lines as check annotations so the reason is
-            # visible without opening the raw log.
-            printf '%s\n' "${out}" | grep -E 'Vulnerability|More info|govulncheck:|no packages|error' | head -20 | while IFS= read -r line; do
-              echo "::error title=govulncheck::${line}"
+            # Surface the output as check annotations so the reason is visible
+            # without opening the raw log (which is served from another host).
+            printf '%s\n' "${out}" | head -25 | while IFS= read -r line; do
+              [ -n "${line}" ] || continue
+              echo "::error title=govulncheck (exit ${status})::${line}"
             done
           fi
           exit "${status}"
