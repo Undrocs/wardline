@@ -157,11 +157,11 @@ var (
 		References:  []string{"https://docs.docker.com/reference/compose-file/services/#ports"},
 		Severity:    findings.SeverityMedium, Confidence: findings.ConfidenceMedium,
 	}
-	ruleCommittedEnvFile = rule{
-		ID: "WL-CFG-020", Title: "Environment file committed to the repository",
-		Description: "A .env file is tracked in the repository.",
-		Impact:      ".env files commonly hold credentials and are rarely intended for version control; repository access becomes credential access.",
-		Remediation: "Remove the file from the repository and its history, add it to .gitignore, keep a sanitised .env.example, and rotate any exposed values.",
+	ruleEnvironmentFile = rule{
+		ID: "WL-CFG-020", Title: "Environment file present in the scanned tree",
+		Description: "A .env file exists in the scanned working tree. Wardline does not run git commands, so it cannot tell whether the file is committed, ignored, or purely local.",
+		Impact:      ".env files commonly hold credentials and are frequently committed by accident; if this file is tracked, repository access becomes credential access.",
+		Remediation: "Confirm whether the file is tracked with `git ls-files --error-unmatch <path>`. If it is, remove it from the repository and its history, add it to .gitignore, keep a sanitised .env.example, and rotate any exposed values.",
 		References:  []string{"https://cwe.mitre.org/data/definitions/538.html"},
 		Severity:    findings.SeverityMedium, Confidence: findings.ConfidenceMedium,
 	}
@@ -191,13 +191,16 @@ func newConfigFinding(r rule, file string, line int, locator, evidence, kind str
 		description = fmt.Sprintf("%s (%s check)", r.Description, kind)
 	}
 	return findings.New(findings.Finding{
-		RuleID:      r.ID,
-		Scanner:     findings.ScannerConfig,
-		Title:       r.Title,
-		Severity:    r.Severity,
-		Confidence:  r.Confidence,
-		Location:    findings.Location{Path: file, StartLine: line},
-		Evidence:    security.SanitizeEvidence(evidence, 200),
+		RuleID:     r.ID,
+		Scanner:    findings.ScannerConfig,
+		Title:      r.Title,
+		Severity:   r.Severity,
+		Confidence: r.Confidence,
+		Location:   findings.Location{Path: file, StartLine: line},
+		// Evidence is excerpted from untrusted build files: RUN lines and Compose
+		// commands can carry credentials in arguments or URLs, so redaction
+		// happens before the value is stored on the finding.
+		Evidence:    security.RedactEvidence(evidence, 200),
 		Description: description,
 		Impact:      r.Impact,
 		Remediation: r.Remediation,
@@ -213,7 +216,7 @@ func Catalog() []rule {
 		ruleSecretBuildArg, ruleRemoteAdd, ruleCredentialCopy, ruleWorldWritable, ruleRemoteScript,
 		rulePrivileged, ruleDockerSocket, ruleHostNetwork, ruleDangerousCapability,
 		ruleUnconfinedProfile, ruleComposeSecretEnv, ruleSensitiveMount, ruleComposeRootUser,
-		ruleSensitivePort, ruleCommittedEnvFile, ruleInsecureTLS,
+		ruleSensitivePort, ruleEnvironmentFile, ruleInsecureTLS,
 	}
 }
 

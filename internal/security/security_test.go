@@ -144,3 +144,124 @@ func TestLooksRandom(t *testing.T) {
 		t.Error("short value was considered random")
 	}
 }
+
+func TestRedactCredentialsMasksEveryShape(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		// wantAbsent are substrings that must not survive redaction.
+		wantAbsent []string
+		// wantPresent are substrings that must survive, proving the surrounding
+		// context is still useful.
+		wantPresent []string
+	}{
+		{
+			name:        "dockerfile env assignment",
+			in:          "ENV DB_PASSWORD=hunter2 API_TOKEN=abc123",
+			wantAbsent:  []string{"hunter2", "abc123"},
+			wantPresent: []string{"DB_PASSWORD", "API_TOKEN"},
+		},
+		{
+			name:        "short password in a run command",
+			in:          "RUN mysql --password=Secr3t99 -e 'select 1'",
+			wantAbsent:  []string{"Secr3t99"},
+			wantPresent: []string{"mysql"},
+		},
+		{
+			name:        "multiple credentials on one line",
+			in:          "curl -H 'Authorization: token ghp_Q7mXr4Tz9KpL2WcV8bN3jH6yF5dS1aE0uG8i' https://x?api_key=AKIAQ7X4R2ZP5RTMNW3V",
+			wantAbsent:  []string{"ghp_Q7mXr4Tz9KpL2WcV8bN3jH6yF5dS1aE0uG8i", "AKIAQ7X4R2ZP5RTMNW3V"},
+			wantPresent: []string{"curl", "https://x"},
+		},
+		{
+			name:        "http auth scheme keeps the token intact",
+			in:          "curl -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl' https://api.example.com",
+			wantAbsent:  []string{"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"},
+			wantPresent: []string{"Bearer", "https://api.example.com"},
+		},
+		{
+			name:        "curl user flag",
+			in:          "RUN curl -u deploy:hunter2 https://artifacts.internal/pkg.tgz",
+			wantAbsent:  []string{"hunter2"},
+			wantPresent: []string{"-u", "deploy:", "https://artifacts.internal"},
+		},
+		{
+			name:        "separate password argument",
+			in:          "RUN mysql --password Secr3t99 -e 'select 1'",
+			wantAbsent:  []string{"Secr3t99"},
+			wantPresent: []string{"--password", "mysql"},
+		},
+		{
+			name:        "url userinfo",
+			in:          "RUN psql postgres://svc:hunter2@db.internal:5432/app",
+			wantAbsent:  []string{"hunter2"},
+			wantPresent: []string{"postgres://svc", "db.internal"},
+		},
+		{
+			name:        "yaml style",
+			in:          "password: \"Lm4Qp9Zx2Tr7Wc5V\"\nuser: app",
+			wantAbsent:  []string{"Lm4Qp9Zx2Tr7Wc5V"},
+			wantPresent: []string{"password:", "user: app"},
+		},
+		{
+			// The header is structural and is what a reader needs to identify
+			// the finding; the key material below it is what must be masked.
+			name:        "private key body",
+			in:          "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0000000000000000abcdefghij\n-----END RSA PRIVATE KEY-----",
+			wantAbsent:  []string{"MIIEowIBAAKCAQEA0000000000000000abcdefghij"},
+			wantPresent: []string{"BEGIN RSA PRIVATE KEY"},
+		},
+		{
+			name:        "placeholder is preserved",
+			in:          "ENV DB_PASSWORD=${DB_PASSWORD}",
+			wantPresent: []string{"${DB_PASSWORD}"},
+		},
+		{
+			name:        "empty input",
+			in:          "",
+			wantPresent: []string{""},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := RedactCredentials(c.in)
+			for _, absent := range c.wantAbsent {
+				if strings.Contains(got, absent) {
+					t.Fatalf("redacted text still contains %q: %q", absent, got)
+				}
+			}
+			for _, present := range c.wantPresent {
+				if !strings.Contains(got, present) {
+					t.Fatalf("redacted text lost %q: %q", present, got)
+				}
+			}
+		})
+	}
+}
+
+func TestRedactCredentialsIsIdempotent(t *testing.T) {
+	// Reports re-run redaction as a safety net, so running it twice must not
+	// keep changing the text.
+	in := "ENV API_KEY=abcd1234efgh RUN curl https://x?token=ghp_Q7mXr4Tz9KpL2WcV8bN3jH6yF5dS1aE0uG8i"
+	once := RedactCredentials(in)
+	twice := RedactCredentials(once)
+	if once != twice {
+		t.Fatalf("redaction is not idempotent:\n once: %q\ntwice: %q", once, twice)
+	}
+	if strings.Contains(once, "abcd1234efgh") {
+		t.Fatalf("short credential survived: %q", once)
+	}
+}
+
+func FuzzRedactCredentials(f *testing.F) {
+	f.Add("password=hunter2")
+	f.Add("postgres://user:pass@host/db")
+	f.Add("AKIAIOSFODNN7EXAMPLE")
+	f.Add("")
+	f.Fuzz(func(t *testing.T, s string) {
+		got := RedactCredentials(s)
+		if got != RedactCredentials(got) {
+			t.Fatalf("not idempotent for %q", s)
+		}
+	})
+}

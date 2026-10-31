@@ -1,16 +1,25 @@
 #!/bin/sh
 # Format, vet, test and race-check Wardline the same way CI does.
 #
-# Usage: scripts/check.sh [--fuzz]
-#   --fuzz  additionally run a short fuzz pass over every fuzz target.
+# Usage: scripts/check.sh [--fuzz] [--release]
+#   --fuzz     additionally run a short fuzz pass over every fuzz target.
+#   --release  additionally build and verify Linux and Windows release archives.
 set -eu
 
 cd "$(dirname "$0")/.."
 
 run_fuzz=false
-if [ "${1:-}" = "--fuzz" ]; then
-	run_fuzz=true
-fi
+run_release=false
+for arg in "$@"; do
+	case "$arg" in
+	--fuzz) run_fuzz=true ;;
+	--release) run_release=true ;;
+	*)
+		echo "unknown option: $arg" >&2
+		exit 2
+		;;
+	esac
+done
 
 echo "== gofmt"
 unformatted="$(gofmt -l .)"
@@ -41,6 +50,11 @@ if [ "$run_fuzz" = true ]; then
 		echo "-- $2"
 		go test "$1" -run '^$' -fuzz "^$2\$" -fuzztime 10s
 	done
+fi
+
+if [ "$run_release" = true ]; then
+	echo "== release packaging"
+	./scripts/release-smoke.sh
 fi
 
 echo "all checks passed"

@@ -129,6 +129,25 @@ jobs:
           go test ./internal/scanners/config/ -run '^$' -fuzz '^FuzzCheckDockerfile$' -fuzztime 20s
           go test ./internal/scanners/config/ -run '^$' -fuzz '^FuzzCheckCompose$' -fuzztime 20s
 
+  release-packaging:
+    name: Release packaging
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build and verify Linux and Windows archives
+        run: sh scripts/release-smoke.sh
+
   self-scan:
     name: Self-scan (offline)
     runs-on: ubuntu-latest
@@ -155,6 +174,22 @@ jobs:
           ./wardline scan . --offline --no-color --format json --output /tmp/wardline-selfscan.json
           ./wardline scan . --offline --no-color --format sarif --output /tmp/wardline-selfscan.sarif
           ./wardline scan . --offline --no-color --format terminal --fail-on critical
+
+      - name: Strict scan ignores the repository's own configuration
+        run: |
+          set -eu
+          # --strict must not trust .wardline.yaml, so the exclusions it defines
+          # (test fixtures, test sources) are ignored as well and have to be
+          # supplied on the command line instead. The run proves the override is
+          # reported and that strict mode does not fail on the repository's own
+          # benign configuration.
+          ./wardline scan . --offline --no-color --strict \
+            --exclude 'testdata/**' --exclude '**/*_test.go' \
+            --fail-on critical --format json --output /tmp/wardline-strict.json
+          grep -q 'strict: ignored' /tmp/wardline-strict.json || {
+            echo "strict mode did not report the configuration it ignored"
+            exit 1
+          }
 
       - name: Fail if any secret value is present in the report
         run: |

@@ -10,13 +10,19 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Undrocs/wardline/internal/netguard"
 )
 
 func newTestClient(t *testing.T, handler http.HandlerFunc) (*Client, *httptest.Server) {
 	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
-	client, err := New(server.URL, &http.Client{Timeout: 2 * time.Second}, WithUserAgent("wardline-test"))
+	client, err := New(server.URL, &http.Client{Timeout: 2 * time.Second},
+		WithUserAgent("wardline-test"),
+		// The test server is a loopback address, which the default policy
+		// refuses; approving it here is exactly what the CLI flag does.
+		WithPolicy(netguard.Policy{AllowCustomEndpoint: true}))
 	if err != nil {
 		t.Fatal(err)
 	}

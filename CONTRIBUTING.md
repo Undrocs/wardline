@@ -42,7 +42,30 @@ go test ./internal/yamlpos/ -run FuzzParse -fuzz FuzzParse -fuzztime 30s
 
 `scripts/check.sh` runs formatting, vet, tests and the race detector in one
 step; `scripts/smoke.sh` builds the binary and verifies the documented exit
-codes against the fixtures.
+codes against the fixtures. Two optional passes:
+
+```sh
+scripts/check.sh --fuzz      # 10s per fuzz target
+scripts/check.sh --release   # build and verify Linux + Windows release archives
+```
+
+`scripts/release-smoke.sh` can be run on its own; it builds one Linux archive
+(and executes it) and one Windows archive, then checks that the verifier rejects
+a Windows archive without `wardline.exe`, a missing file, a mismatched platform
+name and an unsafe tag.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs formatting, vet, `go mod tidy` verification,
+tests on Linux/macOS/Windows, the race detector, a time-boxed fuzz pass, the
+smoke script, the self-scan and the release-packaging check.
+`.github/workflows/security.yml` runs CodeQL (with
+`.github/codeql/codeql-config.yml`), `govulncheck` and dependency review.
+Dependency review needs GitHub's dependency graph, which is a repository setting
+outside the workflow's control; until it is enabled the job reports the
+limitation rather than blocking pull requests.
+Actions are pinned to full commit SHAs; add a new action only with its full SHA
+and a version comment.
 
 ## Non-negotiable rules
 
@@ -106,8 +129,6 @@ a leaked credential. Tests materialise it automatically; to scan it by hand:
 go run ./internal/fixtures/cmd/materialize /tmp/wardline-fixture
 go run ./cmd/wardline scan /tmp/wardline-fixture --offline
 ```
-
-## Tests and fixtures
 
 - Fixtures live under `testdata/` and are **synthetic only**. Use obviously
   fake values (for example `AKIA` + `EXAMPLE`-style bodies), never a real key,

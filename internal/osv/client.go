@@ -22,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Undrocs/wardline/internal/netguard"
 )
 
 // DefaultEndpoint is the official OSV API endpoint.
@@ -38,6 +40,10 @@ const (
 	// maxRetries is the number of additional attempts for retryable failures.
 	maxRetries = 2
 )
+
+// ErrRateLimited marks a response that the endpoint refused because of rate
+// limiting. Callers can distinguish it from a malformed or rejected request.
+var ErrRateLimited = errors.New("OSV endpoint rate limited the request")
 
 // Package identifies a package coordinate.
 type Package struct {
@@ -104,6 +110,7 @@ type QueryResult struct {
 type Client struct {
 	baseURL   string
 	http      *http.Client
+	policy    netguard.Policy
 	userAgent string
 	logf      func(string, ...any)
 
@@ -120,25 +127,19 @@ func WithUserAgent(ua string) Option { return func(c *Client) { c.userAgent = ua
 // WithLogger sets a verbose logger.
 func WithLogger(logf func(string, ...any)) Option { return func(c *Client) { c.logf = logf } }
 
-// New creates a client. When httpClient is nil a safe default is used.
+// WithPolicy sets the outbound network policy. The default policy permits only
+// the official endpoint; a custom endpoint (an internal mirror, a test server)
+// has to be approved explicitly by the caller.
+func WithPolicy(p netguard.Policy) Option { return func(c *Client) { c.policy = p } }
+
+// New creates a client. When httpClient is nil a policy-enforcing default is
+// used.
+//
+// The endpoint is validated against the client policy before any request is
+// made, so an endpoint that reached this function from configuration cannot be
+// used unless the caller approved it.
 func New(baseURL string, httpClient *http.Client, opts ...Option) (*Client, error) {
-	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
-	if baseURL == "" {
-		baseURL = DefaultEndpoint
-	}
-	u, err := url.Parse(baseURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid OSV endpoint: %w", err)
-	}
-	if u.Scheme != "https" && u.Scheme != "http" {
-		return nil, fmt.Errorf("invalid OSV endpoint %q: scheme must be http or https", baseURL)
-	}
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 20 * time.Second}
-	}
 	c := &Client{
-		baseURL:   baseURL,
-		http:      httpClient,
 		userAgent: "wardline",
 		cache:     map[string]*Vulnerability{},
 	}
@@ -147,6 +148,31 @@ func New(baseURL string, httpClient *http.Client, opts ...Option) (*Client, erro
 			opt(c)
 		}
 	}
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = DefaultEndpoint
+	}
+	endpoint, err := netguard.Check(baseURL, c.policy)
+	if err != nil {
+		return nil, fmt.Errorf("invalid OSV endpoint: %w", err)
+	}
+	c.baseURL = endpoint
+	if httpClient == nil {
+		httpClient = netguard.NewHTTPClient(c.policy, 20*time.Second, false)
+	} else {
+		// Honour the caller's transport, timeouts and proxy, but never their
+		// redirect policy: a redirect is how a permitted host would reach a
+		// forbidden one.
+		clone := *httpClient
+		clone.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			first := req.URL
+			if len(via) > 0 {
+				first = via[0].URL
+			}
+			return netguard.CheckRedirect(req.URL, first, c.policy)
+		}
+		httpClient = &clone
+	}
+	c.http = httpClient
 	return c, nil
 }
 
@@ -336,7 +362,9 @@ func (c *Client) once(ctx context.Context, method, endpoint string, payload []by
 	if resp.StatusCode != http.StatusOK {
 		msg := readLimited(resp.Body, 512)
 		switch {
-		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+		case resp.StatusCode == http.StatusTooManyRequests:
+			return true, fmt.Errorf("%w: %s returned HTTP 429 after %d attempt(s)%s", ErrRateLimited, sanitizeURL(endpoint), maxRetries+1, detailSuffix(msg))
+		case resp.StatusCode >= 500:
 			return true, fmt.Errorf("%s returned HTTP %d%s", sanitizeURL(endpoint), resp.StatusCode, detailSuffix(msg))
 		case resp.StatusCode == http.StatusNotFound:
 			return false, fmt.Errorf("%s returned HTTP 404: advisory not found", sanitizeURL(endpoint))

@@ -15,6 +15,7 @@ import (
 	"github.com/Undrocs/wardline/internal/config"
 	"github.com/Undrocs/wardline/internal/engine"
 	"github.com/Undrocs/wardline/internal/findings"
+	"github.com/Undrocs/wardline/internal/netguard"
 	"github.com/Undrocs/wardline/internal/reports"
 	"github.com/Undrocs/wardline/internal/scanners"
 	confscanner "github.com/Undrocs/wardline/internal/scanners/config"
@@ -45,6 +46,18 @@ Flags:
   --no-color           Disable ANSI colour
   --verbose            Print diagnostics to stderr
   --min-confidence <c> Hide findings below confidence low|medium|high
+  --allow-custom-endpoint
+                       Approve network.osvEndpoint as a destination. Without it
+                       only the official OSV endpoint is contacted.
+  --strict             Trust only this command line for security-relevant
+                       settings: scanners cannot be disabled, findings cannot be
+                       suppressed and thresholds cannot be weakened by the
+                       scanned repository's configuration.
+  --fail-incomplete    Exit 3 when any check did not run, so CI cannot pass on a
+                       partial scan.
+  --quiet              Print nothing on success (errors still go to stderr)
+  --summary            Print one summary line (severity counts) instead of the
+                       full finding list
 
 Exit codes: 0 success, 1 policy failure, 2 usage/configuration error,
 3 operational failure.
@@ -64,6 +77,18 @@ type scanOptions struct {
 	Timeout       string
 	NoColor       bool
 	Verbose       bool
+	// AllowCustomEndpoint approves a network.osvEndpoint supplied by
+	// configuration. It is the only way a repository can direct Wardline at a
+	// host other than the official OSV endpoint.
+	AllowCustomEndpoint bool
+	// Strict ignores security-relevant overrides from the scanned repository.
+	Strict bool
+	// FailIncomplete turns incomplete coverage into an operational failure.
+	FailIncomplete bool
+	// Quiet suppresses terminal output when the scan succeeds.
+	Quiet bool
+	// Summary prints severity and coverage counts instead of every finding.
+	Summary bool
 	// Help indicates that usage was requested and printed.
 	Help bool
 }
@@ -119,6 +144,14 @@ func (a *App) runScan(ctx context.Context, args []string, only string) int {
 		return ExitUsage
 	}
 
+	// Strict mode discards security-relevant settings that came from the
+	// scanned repository before any of them take effect. The notices are
+	// reported, never silently applied.
+	var notices []string
+	if opts.Strict {
+		notices = append(notices, applyStrictPolicy(cfg, opts)...)
+	}
+
 	// CLI overrides.
 	if opts.Format != "" {
 		format := strings.ToLower(strings.TrimSpace(opts.Format))
@@ -150,6 +183,21 @@ func (a *App) runScan(ctx context.Context, args []string, only string) int {
 	}
 	if opts.Offline {
 		cfg.Network.Enabled = false
+	}
+
+	// Outbound destination policy. The endpoint may have come from the scanned
+	// repository's configuration, so it is only used when the operator approved
+	// it on the command line; the official endpoint never needs approval.
+	policy := netguard.Policy{AllowCustomEndpoint: opts.AllowCustomEndpoint}
+	endpoint, err := netguard.Check(cfg.Network.OSVEndpoint, policy)
+	if err != nil {
+		fmt.Fprintf(a.Stderr, "wardline: network.osvEndpoint: %v\n", err)
+		return ExitUsage
+	}
+	cfg.Network.OSVEndpoint = endpoint
+	cfg.Network.AllowCustomEndpoint = policy.AllowCustomEndpoint
+	if policy.AllowCustomEndpoint && !netguard.IsOfficial(endpoint) {
+		notices = append(notices, fmt.Sprintf("network: custom endpoint %s approved with --allow-custom-endpoint", endpoint))
 	}
 	if len(opts.Exclude) > 0 {
 		cfg.Exclude = append(cfg.Exclude, opts.Exclude...)
@@ -212,7 +260,8 @@ func (a *App) runScan(ctx context.Context, args []string, only string) int {
 		}
 	}
 
-	httpClient := newHTTPClient(cfg.Timeouts.HTTP)
+	httpClient := netguard.NewHTTPClient(policy, cfg.Timeouts.HTTP,
+		netguard.IsProxyConfigured(a.Getenv))
 	start := a.now()
 	if opts.Verbose {
 		a.verbosef("scanning %s (offline=%t, timeout=%s)", targetAbs, !cfg.Network.Enabled || opts.Offline, timeout)
@@ -221,13 +270,14 @@ func (a *App) runScan(ctx context.Context, args []string, only string) int {
 	result, err := engine.Run(scanCtx, engine.Options{
 		// The target is echoed as typed so reports do not disclose absolute
 		// paths of the machine that produced them; the engine resolves it.
-		Target:     target,
-		Config:     cfg,
-		Offline:    !cfg.Network.Enabled || opts.Offline,
-		Logf:       logf,
-		Scanners:   list,
-		HTTPClient: httpClient,
-		Now:        a.Now,
+		Target:           target,
+		Config:           cfg,
+		Offline:          !cfg.Network.Enabled || opts.Offline,
+		Logf:             logf,
+		Scanners:         list,
+		DisabledScanners: skippedScanners,
+		HTTPClient:       httpClient,
+		Now:              a.Now,
 	})
 	if err != nil {
 		if errors.Is(scanCtx.Err(), context.DeadlineExceeded) {
@@ -244,20 +294,30 @@ func (a *App) runScan(ctx context.Context, args []string, only string) int {
 		return ExitOperational
 	}
 
+	if len(skippedScanners) > 0 {
+		notices = append(notices, "scanners not selected for this scan: "+strings.Join(skippedScanners, ", "))
+	}
 	rep := reports.Build(result, cfg, reports.Options{
 		MinSeverity:   cfg.MinSeverity,
 		MinConfidence: minConfidence,
 		FailOn:        cfg.FailOn,
 		Version:       version.Get(),
+		PolicyNotices: notices,
 	})
 
 	format := cfg.Report.Format
 	if format == "" {
 		format = config.DefaultFormat
 	}
-	if err := a.writeReport(rep, format, opts); err != nil {
-		fmt.Fprintf(a.Stderr, "wardline: writing report: %v\n", err)
-		return ExitOperational
+	// --quiet keeps CI logs readable but must never hide a problem: output is
+	// suppressed only when the scan both completed and passed.
+	suppress := opts.Quiet && format == "terminal" && opts.Output == "" &&
+		!rep.Summary.Policy.Failed && !rep.Summary.Incomplete && len(rep.Errors) == 0
+	if !suppress {
+		if err := a.writeReport(rep, format, opts); err != nil {
+			fmt.Fprintf(a.Stderr, "wardline: writing report: %v\n", err)
+			return ExitOperational
+		}
 	}
 
 	if opts.Verbose {
@@ -275,6 +335,10 @@ func (a *App) runScan(ctx context.Context, args []string, only string) int {
 	}
 	if rep.Summary.Policy.Failed {
 		return ExitPolicy
+	}
+	if opts.FailIncomplete && rep.Summary.Incomplete {
+		fmt.Fprintln(a.Stderr, "wardline: scan is incomplete and --fail-incomplete is set; treat this result as not passed")
+		return ExitOperational
 	}
 	return ExitOK
 }
@@ -299,61 +363,49 @@ func (a *App) now() time.Time {
 
 // writeReport renders the report to the configured destination.
 func (a *App) writeReport(rep *reports.Report, format string, opts scanOptions) error {
-	var (
-		w       io.Writer = a.Stdout
-		file    *os.File
-		outPath string
-	)
-	if opts.Output != "" && opts.Output != "-" {
-		path := opts.Output
-		// Resolve relative output paths against the current working directory.
-		if !filepath.IsAbs(path) {
-			abs, err := filepath.Abs(path)
-			if err != nil {
-				return err
+	render := func(w io.Writer) error {
+		switch format {
+		case "json":
+			return reports.WriteJSON(w, rep)
+		case "markdown":
+			return reports.WriteMarkdown(w, rep)
+		case "sarif":
+			return reports.WriteSARIF(w, rep)
+		default:
+			if opts.Summary {
+				color := !opts.NoColor && opts.Output == "" && a.colorSupported()
+				return reports.WriteSummary(w, rep, reports.TerminalOptions{Color: color, Width: 100})
 			}
-			path = abs
+			color := !opts.NoColor && opts.Output == "" && a.colorSupported()
+			return reports.WriteTerminal(w, rep, reports.TerminalOptions{
+				Color:   color,
+				Verbose: opts.Verbose,
+				Width:   100,
+			})
 		}
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	}
+
+	if opts.Output == "" || opts.Output == "-" {
+		return render(a.Stdout)
+	}
+
+	// Resolve relative output paths against the current working directory.
+	path := opts.Output
+	if !filepath.IsAbs(path) {
+		abs, err := filepath.Abs(path)
 		if err != nil {
 			return err
 		}
-		w = f
-		file = f
-		outPath = path
+		path = abs
 	}
-
-	var err error
-	switch format {
-	case "json":
-		err = reports.WriteJSON(w, rep)
-	case "markdown":
-		err = reports.WriteMarkdown(w, rep)
-	case "sarif":
-		err = reports.WriteSARIF(w, rep)
-	default:
-		color := !opts.NoColor && opts.Output == "" && a.colorSupported()
-		err = reports.WriteTerminal(w, rep, reports.TerminalOptions{
-			Color:   color,
-			Verbose: opts.Verbose,
-			Width:   100,
-		})
-	}
-	if file != nil {
-		// A close error means data may not have reached the disk (full
-		// filesystem, network mount). Reporting success would hide a truncated
-		// report, so it is surfaced as an operational failure.
-		closeErr := file.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}
-	if err != nil {
+	// The report is staged in a temporary file and renamed into place: an
+	// existing file keeps its identity but not its old permissions, a symbolic
+	// link is refused rather than followed, and a failed write cannot leave a
+	// truncated report behind.
+	if err := writeReportFile(path, render); err != nil {
 		return err
 	}
-	if outPath != "" {
-		fmt.Fprintf(a.Stderr, "wardline: %s report written to %s\n", format, outPath)
-	}
+	fmt.Fprintf(a.Stderr, "wardline: %s report written to %s\n", format, path)
 	return nil
 }
 
@@ -391,6 +443,11 @@ func (a *App) parseScanArgs(args []string) (scanOptions, int) {
 	fs.StringVar(&opts.Timeout, "timeout", "", "")
 	fs.BoolVar(&opts.NoColor, "no-color", false, "")
 	fs.BoolVar(&opts.Verbose, "verbose", false, "")
+	fs.BoolVar(&opts.AllowCustomEndpoint, "allow-custom-endpoint", false, "")
+	fs.BoolVar(&opts.Strict, "strict", false, "")
+	fs.BoolVar(&opts.FailIncomplete, "fail-incomplete", false, "")
+	fs.BoolVar(&opts.Quiet, "quiet", false, "")
+	fs.BoolVar(&opts.Summary, "summary", false, "")
 	fs.Bool("help", false, "")
 	fs.Bool("h", false, "")
 

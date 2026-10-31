@@ -23,6 +23,9 @@ type stubScanner struct {
 	panic    bool
 	block    bool
 	seen     []scanners.File
+	// scanResult, when set, is returned verbatim so a test can control skipped
+	// checks and notes.
+	scanResult *scanners.Result
 }
 
 func (s *stubScanner) Name() string { return s.name }
@@ -38,6 +41,9 @@ func (s *stubScanner) Scan(ctx context.Context, req *scanners.Request) (*scanner
 	}
 	if s.err != nil {
 		return nil, s.err
+	}
+	if s.scanResult != nil {
+		return s.scanResult, nil
 	}
 	return &scanners.Result{Findings: s.findings, Scope: "stub"}, nil
 }
@@ -457,4 +463,41 @@ func (n *netStub) Scan(context.Context, *scanners.Request) (*scanners.Result, er
 		Network: []string{"https://api.osv.dev", "https://api.osv.dev"},
 		Notes:   []string{"network disclosure"},
 	}, nil
+}
+
+// TestSkippedChecksMakeTheResultIncomplete verifies the link between a scanner's
+// skipped checks and the report's completeness flag, and that a disabled scanner
+// does not mark the scan incomplete.
+func TestSkippedChecksMakeTheResultIncomplete(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	partial := &stubScanner{name: "secrets"}
+	partial.scanResult = &scanners.Result{
+		Skipped: []scanners.SkippedCheck{{Check: "very long lines", Reason: "2 lines were truncated"}},
+	}
+	res, err := Run(context.Background(), Options{
+		Target: dir, Config: testConfig(),
+		Scanners:         []scanners.Scanner{partial},
+		DisabledScanners: []string{"workflows"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var partialSeen, disabledSeen bool
+	for _, run := range res.Scanners {
+		switch {
+		case run.Name == "workflows" && run.Disabled && run.Status == scanners.StatusSkipped:
+			disabledSeen = true
+		case run.Name == "secrets" && run.Status == scanners.StatusPartial && !run.Disabled:
+			partialSeen = true
+		}
+	}
+	if !partialSeen {
+		t.Fatalf("a skipped check did not mark the scanner partial: %+v", res.Scanners)
+	}
+	if !disabledSeen {
+		t.Fatalf("the disabled scanner was not reported: %+v", res.Scanners)
+	}
 }

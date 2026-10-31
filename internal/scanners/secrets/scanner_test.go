@@ -422,3 +422,187 @@ func TestCancellationStopsScan(t *testing.T) {
 		t.Fatal("a cancelled context must abort the scan instead of returning a clean result")
 	}
 }
+
+// TestPartialCoverageIsReported covers every way the file-level scan can fall
+// short of a complete check. Each one must appear as a skipped check, because a
+// skipped check is what makes the scan incomplete; a warning alone would let a
+// clean verdict stand on content that was never inspected.
+func TestPartialCoverageIsReported(t *testing.T) {
+	t.Run("very long line", func(t *testing.T) {
+		dir := t.TempDir()
+		// The credential sits beyond the 8 KiB cut, so it cannot be found; the
+		// report has to say the line was only partially scanned.
+		long := strings.Repeat("a", maxLineLength+64) + " token=" + fakeGitHubToken
+		writeFile(t, dir, "long.txt", long+"\n")
+		res := runScan(t, dir)
+		if len(res.Findings) != 0 {
+			t.Fatalf("a credential beyond the cut should not be reported: %+v", res.Findings)
+		}
+		if !hasSkipped(res, "very long lines") {
+			t.Fatalf("truncated line was not reported as partial coverage: %+v", res.Skipped)
+		}
+	})
+
+	t.Run("binary file", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "image.bin", "ELF\x00\x01\x02"+fakeGitHubToken)
+		res := runScan(t, dir)
+		if !hasSkipped(res, "binary") {
+			t.Fatalf("binary file was not reported as skipped: %+v", res.Skipped)
+		}
+	})
+
+	t.Run("match limit", func(t *testing.T) {
+		dir := t.TempDir()
+		var b strings.Builder
+		for i := 0; i < maxMatchesPerLine+3; i++ {
+			b.WriteString("AKIA")
+			b.WriteString(strings.Repeat("Q", 16))
+			b.WriteString(" ")
+		}
+		writeFile(t, dir, "many.txt", b.String()+"\n")
+		res := runScan(t, dir)
+		if !hasSkipped(res, "match limit") {
+			t.Fatalf("match cap was not reported: %+v", res.Skipped)
+		}
+	})
+}
+
+func hasSkipped(res *scanners.Result, substr string) bool {
+	for _, sk := range res.Skipped {
+		if strings.Contains(sk.Check, substr) || strings.Contains(sk.Reason, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestFewerFalseNegatives covers the shapes that the first rule set missed:
+// structured (JSON/TOML/YAML) keys, YAML block scalars, strong passwords for
+// loopback databases, and values that merely contain a placeholder word.
+func TestFewerFalseNegatives(t *testing.T) {
+	cases := []struct {
+		name       string
+		file       string
+		content    string
+		wantRule   string
+		wantAbsent string
+	}{
+		{
+			name:       "quoted JSON key",
+			file:       "config/app.json",
+			content:    "{\n  \"password\": \"Xk9mQ2vLp7Rt\",\n  \"api_key\": \"Zq4nB8tWc2Yr6Lp3Hx9K\"\n}\n",
+			wantRule:   "WL-SEC-022",
+			wantAbsent: "Xk9mQ2vLp7Rt",
+		},
+		{
+			name:       "quoted TOML key",
+			file:       "config/app.toml",
+			content:    "[db]\n\"password\" = \"Qw8zRn4Tp2Vb\"\n",
+			wantRule:   "WL-SEC-022",
+			wantAbsent: "Qw8zRn4Tp2Vb",
+		},
+		{
+			name:       "yaml block scalar",
+			file:       "deploy/values.yaml",
+			content:    "database:\n  db_password: |\n    Hy7kLp2Qw9Zn\n  host: db.internal\n",
+			wantRule:   "WL-SEC-022",
+			wantAbsent: "Hy7kLp2Qw9Zn",
+		},
+		{
+			name:       "folded block scalar token",
+			file:       "deploy/values.yaml",
+			content:    "registry:\n  api_key: >-\n    Mp3xVt8Qr5Wn2ZkLp\n",
+			wantRule:   "WL-SEC-023",
+			wantAbsent: "Mp3xVt8Qr5Wn2Zk",
+		},
+		{
+			name:       "strong password for a loopback database",
+			file:       "compose/app.yaml",
+			content:    "services:\n  db:\n    environment:\n      DATABASE_URL: postgres://svc:Jx7Qp2Lm9Rt4@localhost:5432/app\n",
+			wantRule:   "WL-SEC-021",
+			wantAbsent: "Jx7Qp2Lm9Rt4",
+		},
+		{
+			name:       "placeholder word inside a real token",
+			file:       "config/token.yaml",
+			content:    "api_token: \"fake9f8c7b6a5d4e3f2a1b\"\n",
+			wantRule:   "WL-SEC-023",
+			wantAbsent: "fake9f8c7b6a5d4e3f2a1b",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, dir, c.file, c.content)
+			res := runScan(t, dir)
+			if !hasRuleID(res, c.wantRule) {
+				var got []string
+				for _, f := range res.Findings {
+					got = append(got, f.RuleID+" "+f.LocationString())
+				}
+				t.Fatalf("expected %s, got %v", c.wantRule, got)
+			}
+			for _, f := range res.Findings {
+				if strings.Contains(f.Evidence, c.wantAbsent) || strings.Contains(f.Description, c.wantAbsent) {
+					t.Fatalf("finding for %s leaked the credential", f.RuleID)
+				}
+			}
+		})
+	}
+}
+
+func TestPlaceholderAndBlockScalarNegatives(t *testing.T) {
+	content := "database:\n" +
+		"  db_password: |\n" +
+		"    ${DB_PASSWORD}\n" +
+		"  api_key: |\n" +
+		"    your-api-key-here\n" +
+		"description: |\n" +
+		"  Xk9mQ2vLp7RtQw8z\n" +
+		"api_token: fake-token\n" +
+		"other_password: changeme\n"
+	dir := t.TempDir()
+	writeFile(t, dir, "deploy/values.yaml", content)
+	res := runScan(t, dir)
+	if len(res.Findings) != 0 {
+		for _, f := range res.Findings {
+			t.Logf("unexpected finding: %s %s %s", f.RuleID, f.LocationString(), f.Evidence)
+		}
+		t.Fatalf("expected no findings, got %d", len(res.Findings))
+	}
+}
+
+func TestLoopbackDatabaseCredentialHasLowConfidence(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "compose/app.yaml", "DB: postgres://svc:Jx7Qp2Lm9Rt4@localhost:5432/app\n")
+	writeFile(t, dir, "deploy/prod.yaml", "DB: postgres://svc:Jx7Qp2Lm9Rt4@primary.prod.internal:5432/app\n")
+	res := runScan(t, dir)
+	byPath := map[string]findings.Finding{}
+	for _, f := range res.Findings {
+		byPath[f.Location.Path] = f
+	}
+	local, ok := byPath["compose/app.yaml"]
+	if !ok {
+		t.Fatal("a loopback database credential must still be reported")
+	}
+	if local.Confidence != findings.ConfidenceLow {
+		t.Errorf("loopback credential confidence = %s, want low", local.Confidence)
+	}
+	remote, ok := byPath["deploy/prod.yaml"]
+	if !ok {
+		t.Fatal("a remote database credential must be reported")
+	}
+	if remote.Confidence != findings.ConfidenceHigh {
+		t.Errorf("remote credential confidence = %s, want high", remote.Confidence)
+	}
+}
+
+func hasRuleID(res *scanners.Result, id string) bool {
+	for _, f := range res.Findings {
+		if f.RuleID == id {
+			return true
+		}
+	}
+	return false
+}

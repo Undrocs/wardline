@@ -86,12 +86,14 @@ func WriteTerminal(w io.Writer, rep *Report, opts TerminalOptions) error {
 			label += " " + run.Scope
 		}
 		status := ""
-		switch run.Status {
-		case scanners.StatusPartial:
+		switch {
+		case run.Disabled:
+			status = " (disabled)"
+		case run.Status == scanners.StatusPartial:
 			status = " (partial)"
-		case scanners.StatusSkipped:
+		case run.Status == scanners.StatusSkipped:
 			status = " (skipped)"
-		case scanners.StatusFailed:
+		case run.Status == scanners.StatusFailed:
 			status = " (failed)"
 		}
 		statusParts = append(statusParts, label+status)
@@ -130,9 +132,23 @@ func WriteTerminal(w io.Writer, rep *Report, opts TerminalOptions) error {
 		bw.printf("\n")
 	}
 
+	// Policy notices are always shown: they record decisions that weaken or
+	// redirect the scan, and hiding them behind --verbose would make an ignored
+	// override silent.
+	if len(rep.PolicyNotices) > 0 {
+		bw.printf("%s\n", paint(opts.Color, ansiBold, "Policy"))
+		for _, notice := range rep.PolicyNotices {
+			bw.wrap("  ", notice, width)
+		}
+		bw.printf("\n")
+	}
+
 	// Incomplete checks.
 	var skippedLines []string
 	for _, run := range rep.Scanners {
+		if run.Disabled {
+			continue
+		}
 		for _, sk := range run.Skipped {
 			skippedLines = append(skippedLines, fmt.Sprintf("%s: %s — %s", run.Name, sk.Check, sk.Reason))
 		}
@@ -174,6 +190,62 @@ func WriteTerminal(w io.Writer, rep *Report, opts TerminalOptions) error {
 	} else {
 		bw.printf("%s\n", paint(opts.Color, ansiBold,
 			fmt.Sprintf("result     PASS — no findings at or above %s", rep.Summary.Policy.FailOn)))
+	}
+	return bw.err
+}
+
+// WriteSummary renders a compact, machine-independent summary: the result, the
+// severity counts and which checks did not run. It never lists individual
+// findings, so a CI log stays short while still stating whether the scan can be
+// trusted.
+func WriteSummary(w io.Writer, rep *Report, opts TerminalOptions) error {
+	if rep == nil {
+		return fmt.Errorf("no report")
+	}
+	width := opts.Width
+	if width < 60 {
+		width = 80
+	}
+	bw := &errWriter{w: w}
+
+	bw.printf("%s %s · %s\n", rep.Tool.Name, rep.Tool.Version, orDefault(rep.Scan.Target, "."))
+	bw.printf("findings   %s\n", formatCounts(rep.Summary.Counts, opts.Color))
+	if rep.Summary.Suppressed > 0 {
+		bw.printf("suppressed %d (listed in the full report)\n", rep.Summary.Suppressed)
+	}
+
+	var disabled []string
+	var partial []string
+	for _, run := range rep.Scanners {
+		switch {
+		case run.Disabled:
+			disabled = append(disabled, run.Name)
+		case run.Status != scanners.StatusRan:
+			partial = append(partial, fmt.Sprintf("%s (%s)", run.Name, run.Status))
+		}
+	}
+	if len(disabled) > 0 {
+		bw.printf("%s\n", paint(opts.Color, ansiDim, "not selected: "+strings.Join(disabled, ", ")))
+	}
+	if len(partial) > 0 {
+		bw.printf("%s\n", paint(opts.Color, ansiYellow, "incomplete checks: "+strings.Join(partial, ", ")))
+	}
+	for _, notice := range rep.PolicyNotices {
+		bw.wrap("policy     ", notice, width)
+	}
+
+	if rep.Summary.Total > 0 {
+		bw.printf("%s\n", paint(opts.Color, ansiDim,
+			fmt.Sprintf("%d finding(s) omitted; use --format json or markdown for detail", rep.Summary.Total)))
+	}
+
+	switch {
+	case rep.Summary.Policy.Failed:
+		bw.printf("%s\n", paint(opts.Color, ansiRed+ansiBold, "result     FAIL — "+rep.Summary.Policy.Reason))
+	case rep.Summary.Incomplete:
+		bw.printf("%s\n", paint(opts.Color, ansiYellow, "result     INCOMPLETE — some checks did not run; this is not a clean result"))
+	default:
+		bw.printf("%s\n", paint(opts.Color, ansiBold, "result     PASS — no findings at or above "+rep.Summary.Policy.FailOn))
 	}
 	return bw.err
 }

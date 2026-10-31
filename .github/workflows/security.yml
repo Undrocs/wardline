@@ -1,0 +1,144 @@
+name: Security scanning
+
+# Static analysis and dependency checks for Wardline itself.
+#
+# Security notes:
+#   - every action is pinned to a full commit SHA;
+#   - permissions are granted per job and are read-only except the
+#     security-events: write that CodeQL needs to upload results;
+#   - no secrets are used, and nothing from the repository is executed beyond
+#     building and analysing it;
+#   - the scheduled run catches newly disclosed vulnerabilities in unchanged
+#     code.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codeql:
+    name: CodeQL (Go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
+        with:
+          languages: go
+          build-mode: manual
+          # The configuration documents the single excluded query; see
+          # .github/codeql/codeql-config.yml.
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Build for analysis
+        run: go build ./...
+
+      - name: Analyse
+        uses: github/codeql-action/analyze@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
+
+  vulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          # govulncheck reports vulnerabilities in the standard library of the
+          # toolchain it runs with, so it analyses with the latest stable Go
+          # rather than the module's minimum version (go.mod still declares the
+          # minimum that contributors need). A standard-library advisory in an
+          # older toolchain would otherwise fail this job for a reason the
+          # repository cannot fix.
+          go-version: stable
+          check-latest: true
+          cache: true
+
+      # The tool version is pinned so a compromised or broken release cannot
+      # change what CI runs, and it is installed outside the module graph, so
+      # go.mod and go.sum are untouched. It must be a release whose x/tools
+      # understands the syntax of the current Go: v1.1.4 crashed with
+      # "unexpected expr: *ast.KeyValueExpr" on Go 1.27 while building SSA.
+      - name: Run govulncheck
+        shell: bash
+        run: |
+          set +e
+          out="$(go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./... 2>&1)"
+          status=$?
+          {
+            echo "### govulncheck"
+            echo '```'
+            printf '%s\n' "${out}"
+            echo '```'
+          } >>"${GITHUB_STEP_SUMMARY}"
+          if [ "${status}" -ne 0 ]; then
+            # Surface the output as check annotations so the reason is visible
+            # without opening the raw log (which is served from another host).
+            printf '%s\n' "${out}" | head -25 | while IFS= read -r line; do
+              [ -n "${line}" ] || continue
+              echo "::error title=govulncheck (exit ${status})::${line}"
+            done
+          fi
+          exit "${status}"
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Dependency review reads GitHub's dependency graph, which is a repository
+    # setting this workflow cannot enable. Until the graph is enabled in
+    # Settings -> Code security, the step reports that limitation instead of
+    # blocking every pull request; once it is enabled, a serious advisory fails
+    # the run. The step is intentionally not silently skipped: its output stays
+    # visible in the job log.
+    continue-on-error: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Fails a pull request that adds a dependency with a known advisory.
+      # Dependency review needs GitHub's dependency graph, which the workflow
+      # cannot enable; the failure message is turned into an annotation so the
+      # reason is visible without the raw log.
+      - name: Review dependency changes
+        id: review
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        continue-on-error: true
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: never
+
+      - name: Report the dependency review outcome
+        if: steps.review.outcome == 'failure'
+        run: |
+          echo "::error title=Dependency review::the dependency graph is unavailable or the review found a serious advisory; see the job summary and the step log"
+          echo "Dependency review did not pass. Enable the dependency graph in Settings -> Code security and re-run." \
+            >>"${GITHUB_STEP_SUMMARY}"

@@ -72,10 +72,20 @@ func LooksLikePlaceholder(value string) bool {
 	for _, marker := range []string{
 		"example.com", "example.org", "your-", "your_", "xxx", "changeme",
 		"replace-me", "replaceme", "placeholder", "redacted", "not-a-real",
-		"fake", "dummy", "insecure", "development-only", "localhost",
 		"<your", "${", "{{",
 	} {
 		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	// Words such as "fake" or "localhost" only mark a value as documentation
+	// when they form a whole word. Substring matching discarded real
+	// credentials (a token generated from a word list can contain "fake" or
+	// "insecure" by accident) and every credential whose host is localhost.
+	for _, word := range []string{
+		"fake", "dummy", "insecure", "development-only", "localhost", "example",
+	} {
+		if containsWord(lower, word) {
 			return true
 		}
 	}
@@ -88,6 +98,32 @@ func LooksLikePlaceholder(value string) bool {
 		return true
 	}
 	return false
+}
+
+// containsWord reports whether word appears in s delimited by non-alphanumeric
+// characters (or the string boundaries).
+func containsWord(s, word string) bool {
+	for offset := 0; ; {
+		idx := strings.Index(s[offset:], word)
+		if idx < 0 {
+			return false
+		}
+		start := offset + idx
+		end := start + len(word)
+		beforeOK := start == 0 || !isWordByte(s[start-1])
+		afterOK := end == len(s) || !isWordByte(s[end])
+		if beforeOK && afterOK {
+			return true
+		}
+		offset = start + 1
+		if offset >= len(s) {
+			return false
+		}
+	}
+}
+
+func isWordByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_'
 }
 
 func allSameRune(s string) bool {

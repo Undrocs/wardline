@@ -46,6 +46,11 @@ func writeProject(t *testing.T, files map[string]string) string {
 }
 
 var cleanProject = map[string]string{
+	// A Go module with a dependency, so the dependency scanner has real
+	// coordinates: an offline scan then has a lookup to skip, which is what makes
+	// it incomplete rather than clean.
+	"go.mod": "module example.com/clean\n\ngo 1.23\n\nrequire github.com/goccy/go-yaml v1.19.2\n",
+	"go.sum": "github.com/goccy/go-yaml v1.19.2 h1:abc123\n",
 	"internal/app.go": `package internal
 
 import "os"
@@ -208,6 +213,37 @@ func TestMinConfidenceDoesNotHidePolicy(t *testing.T) {
 	}
 	if !rep.Summary.Policy.Failed {
 		t.Fatal("policy must be evaluated over unfiltered findings")
+	}
+}
+
+// TestAbsoluteTargetIsReducedForEveryFormat extends the absolute-path test to
+// the machine-specific parts of the path and to SARIF.
+func TestAbsoluteTargetIsReducedForEveryFormat(t *testing.T) {
+	dir := writeProject(t, secretProject)
+	// t.TempDir() hands out a path under the test's scratch directory, which
+	// contains the OS user's name on most systems.
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Dir(abs)
+	for _, format := range []string{"json", "markdown", "sarif", "terminal"} {
+		app, stdout, _ := newTestApp(t)
+		args := []string{"scan", abs, "--offline", "--no-color"}
+		if format != "terminal" {
+			args = append(args, "--format", format)
+		}
+		_ = app.Run(context.Background(), args)
+		out := stdout.String()
+		if strings.Contains(out, parent) {
+			t.Errorf("%s output disclosed the parent directory %q", format, parent)
+		}
+		if strings.Contains(out, abs) {
+			t.Errorf("%s output disclosed the absolute target", format)
+		}
+		if !strings.Contains(out, filepath.Base(abs)) {
+			t.Errorf("%s output does not name the scanned directory", format)
+		}
 	}
 }
 
@@ -414,7 +450,9 @@ jobs:
 	}
 	var rep struct {
 		Scanners []struct {
-			Name string `json:"name"`
+			Name     string `json:"name"`
+			Disabled bool   `json:"disabled"`
+			Findings int    `json:"findings"`
 		} `json:"scanners"`
 		Findings []struct {
 			Scanner string `json:"scanner"`
@@ -424,8 +462,20 @@ jobs:
 	if err := json.Unmarshal(stdout.Bytes(), &rep); err != nil {
 		t.Fatal(err)
 	}
-	if len(rep.Scanners) != 1 || rep.Scanners[0].Name != "secrets" {
-		t.Fatalf("expected only the secrets scanner, got %+v", rep.Scanners)
+	// Every scanner appears in the report: the one that ran, and the three that
+	// were not selected, so a reader can see what was not checked.
+	ran := map[string]bool{}
+	for _, sc := range rep.Scanners {
+		if sc.Disabled {
+			continue
+		}
+		ran[sc.Name] = true
+	}
+	if len(ran) != 1 || !ran["secrets"] {
+		t.Fatalf("expected only the secrets scanner to run, got %+v", rep.Scanners)
+	}
+	if len(rep.Scanners) != 4 {
+		t.Fatalf("expected all four scanners to be reported, got %+v", rep.Scanners)
 	}
 	for _, f := range rep.Findings {
 		if f.Scanner != "secrets" {
@@ -609,5 +659,278 @@ func TestReorderArgs(t *testing.T) {
 		if strings.Join(got, " ") != strings.Join(c.want, " ") {
 			t.Errorf("reorderArgs(%v) = %v, want %v", c.in, got, c.want)
 		}
+	}
+}
+
+// writeConfig drops a .wardline.yaml into a project directory.
+func writeConfig(t *testing.T, dir, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, ".wardline.yaml"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMaliciousConfigCannotRedirectNetwork covers the case where a scanned
+// repository ships a .wardline.yaml pointing the dependency scanner at an
+// attacker-controlled host: a metadata service, a private address or an
+// arbitrary public host. None of them may be contacted without approval.
+func TestMaliciousConfigCannotRedirectNetwork(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+		wantExit int
+		wantErr  string
+	}{
+		{"metadata service", "https://169.254.169.254", ExitUsage, "metadata"},
+		{"private address", "https://10.0.0.5:8080", ExitUsage, "allow-custom-endpoint"},
+		{"public custom host", "https://collector.example.com", ExitUsage, "allow-custom-endpoint"},
+		{"plain http public host", "http://osv.example.com", ExitUsage, "must use https"},
+		{"loopback", "https://127.0.0.1:9999", ExitUsage, "allow-custom-endpoint"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := writeProject(t, cleanProject)
+			writeConfig(t, dir, "network:\n  osvEndpoint: "+c.endpoint+"\n")
+			app, _, stderr := newTestApp(t)
+			code := app.Run(context.Background(), []string{"scan", dir, "--no-color"})
+			if code != c.wantExit {
+				t.Fatalf("exit code %d (%s), want %d", code, stderr.String(), c.wantExit)
+			}
+			if !strings.Contains(stderr.String(), c.wantErr) {
+				t.Fatalf("stderr %q does not explain the rejection (%q)", stderr.String(), c.wantErr)
+			}
+		})
+	}
+}
+
+func TestApprovedCustomEndpointIsUsedAndDisclosed(t *testing.T) {
+	// The endpoint is approved but unreachable, so the dependency scanner fails
+	// and the scan is reported as incomplete. What matters here is that the
+	// approval is honoured and recorded in the report.
+	dir := writeProject(t, map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.23\n\nrequire github.com/pkg/errors v0.9.1\n",
+	})
+	writeConfig(t, dir, "network:\n  osvEndpoint: https://127.0.0.1:1\n")
+	app, stdout, _ := newTestApp(t)
+	code := app.Run(context.Background(), []string{
+		"scan", dir, "--allow-custom-endpoint", "--format", "json", "--timeout", "30s",
+	})
+	_ = code // the exit code depends on the unreachable endpoint; the report is what we assert
+	var rep struct {
+		PolicyNotices []string `json:"policyNotices"`
+		Network       struct {
+			Destinations []string `json:"destinations"`
+		} `json:"network"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &rep); err != nil {
+		t.Fatalf("decode report: %v (%s)", err, stdout.String())
+	}
+	joined := strings.Join(rep.PolicyNotices, "\n")
+	if !strings.Contains(joined, "127.0.0.1:1") || !strings.Contains(joined, "approved") {
+		t.Fatalf("approval was not disclosed: %v", rep.PolicyNotices)
+	}
+}
+
+func TestStrictModeIgnoresRepositoryOverrides(t *testing.T) {
+	dir := writeProject(t, map[string]string{
+		"app/secrets.go": "package app\n\nconst token = \"" + fakeGitHubToken + "\"\n",
+	})
+	// Every one of these settings would weaken the scan if it were honoured.
+	writeConfig(t, dir, `
+scanners:
+  secrets: false
+  dependencies: true
+  workflows: true
+  config: true
+exclude:
+  - "**"
+severity:
+  failOn: critical
+report:
+  minSeverity: high
+rules:
+  disable: [WL-SEC-003]
+  severity:
+    WL-SEC-003: info
+suppressions:
+  - rule: WL-SEC-003
+    reason: "Trust us."
+network:
+  enabled: false
+`)
+	app, stdout, _ := newTestApp(t)
+	code := app.Run(context.Background(), []string{"scan", dir, "--strict", "--offline", "--format", "json"})
+	if code != ExitPolicy {
+		t.Fatalf("strict mode exited %d, want %d (the secret must still be found and fail the gate)", code, ExitPolicy)
+	}
+	var rep struct {
+		Findings []struct {
+			RuleID     string                `json:"ruleId"`
+			Suppressed bool                  `json:"suppressed"`
+			Severity   string                `json:"severity"`
+			Location   struct{ Path string } `json:"location"`
+		} `json:"findings"`
+		PolicyNotices []string `json:"policyNotices"`
+		Summary       struct {
+			Policy struct {
+				FailOn string `json:"failOn"`
+			} `json:"policy"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &rep); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, f := range rep.Findings {
+		if f.RuleID == "WL-SEC-003" {
+			found = true
+			if f.Suppressed {
+				t.Error("strict mode honoured a repository suppression")
+			}
+			if f.Severity != "high" {
+				t.Errorf("strict mode honoured a rule severity override: %s", f.Severity)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("strict mode excluded the file through the repository's exclude pattern")
+	}
+	if rep.Summary.Policy.FailOn != "high" {
+		t.Errorf("strict mode did not restore the fail-on threshold: %s", rep.Summary.Policy.FailOn)
+	}
+	joined := strings.Join(rep.PolicyNotices, "\n")
+	for _, want := range []string{"scanners.secrets", "exclude", "suppression", "rules.disable", "rules.severity", "failOn", "minSeverity"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("policy notices do not mention %q:\n%s", want, joined)
+		}
+	}
+}
+
+func TestStrictModeKeepsUntrustedEndpointOut(t *testing.T) {
+	dir := writeProject(t, cleanProject)
+	writeConfig(t, dir, "network:\n  osvEndpoint: https://collector.example.com\n")
+	app, stdout, _ := newTestApp(t)
+	code := app.Run(context.Background(), []string{"scan", dir, "--strict", "--offline", "--format", "json"})
+	if code != ExitOK {
+		t.Fatalf("strict scan exited %d", code)
+	}
+	if strings.Contains(stdout.String(), "collector.example.com") {
+		t.Fatalf("strict mode kept the untrusted endpoint: %s", stdout.String())
+	}
+}
+
+func TestFailIncompleteTurnsPartialCoverageIntoFailure(t *testing.T) {
+	// An oversized file is skipped, which makes coverage partial without any
+	// scanner failing.
+	dir := writeProject(t, cleanProject)
+	writeConfig(t, dir, "limits:\n  maxFileSize: 1KiB\n")
+	big := strings.Repeat("x", 4096)
+	if err := os.WriteFile(filepath.Join(dir, "big.txt"), []byte(big), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	app, _, _ := newTestApp(t)
+	if code := app.Run(context.Background(), []string{"scan", dir, "--offline", "--no-color"}); code != ExitOK {
+		t.Fatalf("baseline scan exited %d, want 0", code)
+	}
+
+	app, stdout, stderr := newTestApp(t)
+	code := app.Run(context.Background(), []string{"scan", dir, "--offline", "--no-color", "--fail-incomplete"})
+	if code != ExitOperational {
+		t.Fatalf("--fail-incomplete exited %d, want %d", code, ExitOperational)
+	}
+	if !strings.Contains(stderr.String(), "incomplete") {
+		t.Fatalf("stderr does not explain the failure: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "INCOMPLETE") {
+		t.Fatalf("the report should still be produced: %s", stdout.String())
+	}
+}
+
+func TestQuietSuppressesOutputOnlyWhenClean(t *testing.T) {
+	// A project with no dependency manifest: nothing is skipped, so the scan is
+	// genuinely complete. (An offline scan of a project that does have
+	// dependencies is incomplete, and --quiet must not hide that.)
+	clean := writeProject(t, map[string]string{
+		"internal/app.go": cleanProject["internal/app.go"],
+	})
+	app, stdout, _ := newTestApp(t)
+	if code := app.Run(context.Background(), []string{"scan", clean, "--offline", "--quiet"}); code != ExitOK {
+		t.Fatalf("exit %d", code)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("--quiet printed %q on a clean scan", stdout.String())
+	}
+
+	// A failing scan must still be visible.
+	dirty := writeProject(t, secretProject)
+	app, stdout, _ = newTestApp(t)
+	if code := app.Run(context.Background(), []string{"scan", dirty, "--offline", "--quiet"}); code != ExitPolicy {
+		t.Fatalf("exit %d", code)
+	}
+	if stdout.Len() == 0 {
+		t.Fatal("--quiet hid a failing scan")
+	}
+}
+
+func TestSummaryPrintsCountsWithoutFindings(t *testing.T) {
+	dir := writeProject(t, secretProject)
+	app, stdout, _ := newTestApp(t)
+	if code := app.Run(context.Background(), []string{"scan", dir, "--offline", "--summary"}); code != ExitPolicy {
+		t.Fatalf("exit %d", code)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "findings") || !strings.Contains(out, "result") {
+		t.Fatalf("summary is missing its summary: %s", out)
+	}
+	if strings.Contains(out, "WL-SEC-003") {
+		t.Fatalf("--summary listed individual findings: %s", out)
+	}
+}
+
+// TestEvidenceIsRedactedInEveryFormat scans a project whose build files carry
+// credentials in their command lines, then checks that no report format leaks
+// them. This is the end-to-end guard for the redaction contract: scanners
+// redact before storage, and the reporters redact again as a safety net.
+func TestEvidenceIsRedactedInEveryFormat(t *testing.T) {
+	const bearer = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJlLXZhbHVl"
+	const dbPassword = "Secr3tP4ss99"
+	const pypiPassword = "PyP1Secret77"
+	project := map[string]string{
+		"deploy/Dockerfile": "FROM alpine:3.20\n" +
+			"USER app\n" +
+			"RUN curl -H 'Authorization: Bearer " + bearer + "' https://api.example.com/install.sh | sh\n" +
+			"RUN pip install --index-url https://ci:" + pypiPassword + "@packages.example.com/simple demo\n",
+		".github/workflows/ci.yml": "name: ci\non: [push]\npermissions:\n  contents: read\n" +
+			"jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n" +
+			"      - run: mysql --password " + dbPassword + " -e 'select 1'\n",
+	}
+	dir := writeProject(t, project)
+
+	for _, format := range []string{"json", "markdown", "sarif", "terminal"} {
+		t.Run(format, func(t *testing.T) {
+			app, stdout, stderr := newTestApp(t)
+			args := []string{"scan", dir, "--offline", "--no-color"}
+			if format != "terminal" {
+				args = append(args, "--format", format)
+			}
+			_ = app.Run(context.Background(), args)
+			out := stdout.String() + stderr.String()
+			for _, secret := range []string{bearer, dbPassword, pypiPassword} {
+				if strings.Contains(out, secret) {
+					t.Fatalf("%s output leaked a credential (%q)\n%s", format, secret, out)
+				}
+			}
+			// The findings must still be there: redaction removes the secret,
+			// not the evidence that the rule fired.
+			if !strings.Contains(out, "WL-CFG-008") && !strings.Contains(out, "WL-WF-") {
+				t.Fatalf("%s output lost the findings entirely:\n%s", format, out)
+			}
+			if format == "json" || format == "sarif" {
+				if !json.Valid(stdout.Bytes()) {
+					t.Fatalf("%s output is not valid JSON after redaction", format)
+				}
+			}
+		})
 	}
 }

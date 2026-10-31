@@ -14,6 +14,7 @@ import (
 	"github.com/Undrocs/wardline/internal/engine"
 	"github.com/Undrocs/wardline/internal/findings"
 	"github.com/Undrocs/wardline/internal/scanners"
+	"github.com/Undrocs/wardline/internal/security"
 	"github.com/Undrocs/wardline/internal/version"
 )
 
@@ -88,6 +89,9 @@ type Report struct {
 	Errors        []string            `json:"errors,omitempty"`
 	// Limitations lists scan-level caveats that readers must not ignore.
 	Limitations []string `json:"limitations"`
+	// PolicyNotices lists policy decisions taken for this scan, including
+	// configuration overrides that were ignored.
+	PolicyNotices []string `json:"policyNotices,omitempty"`
 }
 
 // Options controls report construction.
@@ -103,6 +107,10 @@ type Options struct {
 	FailOn findings.Severity
 	// Version is the binary metadata.
 	Version version.Info
+	// PolicyNotices records policy decisions the operator must see: overrides
+	// that were ignored, a scanner disabled by configuration, an approval that
+	// widened the scan. They are rendered in every format.
+	PolicyNotices []string
 }
 
 // Limitations that apply to every scan, independent of findings.
@@ -130,7 +138,10 @@ func Build(res *engine.Result, cfg *config.Config, opts Options) *Report {
 			Platform:  opts.Version.Platform,
 		},
 		Scan: ScanInfo{
-			Target:     res.Target,
+			// The target is echoed for humans, never as a machine path: an
+			// absolute target is reduced to its final element so a shared report
+			// does not disclose usernames or directory layouts.
+			Target:     security.SanitizeTarget(res.Target),
 			Mode:       res.Mode,
 			StartedAt:  res.StartedAt.Format(time.RFC3339),
 			FinishedAt: res.FinishedAt.Format(time.RFC3339),
@@ -140,10 +151,11 @@ func Build(res *engine.Result, cfg *config.Config, opts Options) *Report {
 			Offline:    res.Offline,
 			ConfigFile: res.ConfigPath,
 		},
-		Scanners:    res.Scanners,
-		Warnings:    res.Warnings,
-		Errors:      res.Errors,
-		Limitations: baseLimitations(),
+		Scanners:      res.Scanners,
+		Warnings:      res.Warnings,
+		Errors:        res.Errors,
+		Limitations:   baseLimitations(),
+		PolicyNotices: opts.PolicyNotices,
 	}
 
 	networkEnabled := false
@@ -164,6 +176,10 @@ func Build(res *engine.Result, cfg *config.Config, opts Options) *Report {
 	suppressed := 0
 	visible := make([]findings.Finding, 0, len(res.Findings))
 	for _, f := range res.Findings {
+		// Defence in depth: scanners redact their own evidence, but every report
+		// writer shares this model, so a credential that slipped through one
+		// scanner would still never reach terminal, JSON, Markdown or SARIF.
+		f.Evidence = security.RedactCredentials(f.Evidence)
 		if f.Suppressed {
 			suppressed++
 			suppressedCounts.Add(f.Severity)
@@ -209,9 +225,19 @@ func Build(res *engine.Result, cfg *config.Config, opts Options) *Report {
 			rep.Summary.ScannersFailed++
 		}
 	}
+	notSelected := 0
+	for _, run := range res.Scanners {
+		if run.Disabled {
+			notSelected++
+		}
+	}
+	// A scanner that was never selected (an `audit` subcommand, or a scanner
+	// turned off by configuration) is reported, but it is not a coverage gap:
+	// the operator asked for that scope. Any other skipped scanner means checks
+	// that were supposed to run did not.
 	rep.Summary.Incomplete = res.PartialCoverage || len(res.Errors) > 0 ||
-		rep.Summary.ScannersPartial > 0 || rep.Summary.ScannersSkipped > 0 ||
-		rep.Summary.ScannersFailed > 0
+		rep.Summary.ScannersPartial > 0 || rep.Summary.ScannersFailed > 0 ||
+		rep.Summary.ScannersSkipped > notSelected
 	return rep
 }
 

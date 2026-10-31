@@ -22,12 +22,21 @@ replace example.com/old => example.com/new v1.0.0
 
 exclude example.com/bad v1.0.0
 `)
-	res := parseGoMod("go.mod", data)
-	if len(res.Packages) != 4 {
-		t.Fatalf("expected 4 packages, got %d: %+v", len(res.Packages), res.Packages)
+	mod, warnings := parseGoMod("go.mod", data)
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", warnings)
+	}
+	// Replacements are applied by applyGoReplacements; the parse step keeps the
+	// directives so callers can decide what to do with them.
+	resolved, local, notes := applyGoReplacements(mod.Requires, mod.Replaces, mod.Excludes)
+	if len(local) != 0 || len(notes) != 0 {
+		t.Fatalf("unexpected replacements: local=%v notes=%v", local, notes)
+	}
+	if len(resolved) != 4 {
+		t.Fatalf("expected 4 packages, got %d: %+v", len(resolved), resolved)
 	}
 	byName := map[string]Package{}
-	for _, p := range res.Packages {
+	for _, p := range resolved {
 		byName[p.Name] = p
 		if p.Ecosystem != EcosystemGo {
 			t.Errorf("unexpected ecosystem %q", p.Ecosystem)
@@ -51,15 +60,15 @@ require (
 	example.com/missing-version
 	example.com/badversion not-a-version
 `)
-	res := parseGoMod("go.mod", data)
-	if len(res.Packages) != 0 {
-		t.Fatalf("expected no usable packages, got %+v", res.Packages)
+	mod, warnings := parseGoMod("go.mod", data)
+	if len(mod.Requires) != 0 {
+		t.Fatalf("expected no usable packages, got %+v", mod.Requires)
 	}
-	if len(res.Warnings) < 2 {
-		t.Fatalf("expected warnings for malformed directives, got %v", res.Warnings)
+	if len(warnings) < 2 {
+		t.Fatalf("expected warnings for malformed directives, got %v", warnings)
 	}
-	if !strings.Contains(strings.Join(res.Warnings, " "), "unterminated") {
-		t.Errorf("expected an unterminated block warning: %v", res.Warnings)
+	if !strings.Contains(strings.Join(warnings, " "), "unterminated") {
+		t.Errorf("expected an unterminated block warning: %v", warnings)
 	}
 }
 
@@ -198,5 +207,178 @@ func TestNpmPackageNameFromPath(t *testing.T) {
 		if got := npmPackageNameFromPath(input); got != want {
 			t.Errorf("npmPackageNameFromPath(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestApplyGoReplacements(t *testing.T) {
+	requires := []Package{
+		{Ecosystem: EcosystemGo, Name: "example.com/local", Version: "v1.0.0", Direct: true},
+		{Ecosystem: EcosystemGo, Name: "example.com/bump", Version: "v1.0.0", Direct: true},
+		{Ecosystem: EcosystemGo, Name: "example.com/swap", Version: "v1.0.0", Direct: true},
+		{Ecosystem: EcosystemGo, Name: "example.com/gone", Version: "v1.0.0", Direct: true},
+		{Ecosystem: EcosystemGo, Name: "example.com/kept", Version: "v2.0.0", Direct: true},
+	}
+	replaces := []goReplace{
+		{OldPath: "example.com/local", NewPath: "../local", Local: true},
+		{OldPath: "example.com/bump", OldVersion: "v1.0.0", NewPath: "example.com/bump", NewVersion: "v1.4.2"},
+		{OldPath: "example.com/swap", NewPath: "example.com/fork", NewVersion: "v0.9.0"},
+	}
+	excludes := []goExclude{{Path: "example.com/gone", Version: "v1.0.0"}}
+
+	out, local, notes := applyGoReplacements(requires, replaces, excludes)
+	byName := map[string]Package{}
+	for _, p := range out {
+		byName[p.Name] = p
+	}
+	if _, ok := byName["example.com/local"]; ok {
+		t.Error("a module replaced by a local path must not be reported at its published version")
+	}
+	if len(local) != 1 || local[0].Name != "example.com/local" {
+		t.Errorf("local replacement not reported: %+v", local)
+	}
+	if got := byName["example.com/bump"].Version; got != "v1.4.2" {
+		t.Errorf("version replacement not applied: %s", got)
+	}
+	if got, ok := byName["example.com/fork"]; !ok || got.Version != "v0.9.0" {
+		t.Errorf("module replacement not applied: %+v", out)
+	}
+	if _, ok := byName["example.com/swap"]; ok {
+		t.Error("the replaced module still appears under its original name")
+	}
+	if _, ok := byName["example.com/gone"]; ok {
+		t.Error("an excluded version was still reported")
+	}
+	if got := byName["example.com/kept"].Version; got != "v2.0.0" {
+		t.Errorf("unreplaced module changed: %s", got)
+	}
+	if len(notes) < 3 {
+		t.Errorf("replacements should be disclosed in the report: %v", notes)
+	}
+}
+
+func TestParseGoWork(t *testing.T) {
+	data := []byte(`go 1.23
+
+use (
+	./service
+	./library
+)
+
+replace example.com/old => ../vendor/old
+
+replace example.com/bump v1.0.0 => example.com/bump v1.2.0
+`)
+	replaces, uses, warnings := parseGoWork("go.work", data)
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", warnings)
+	}
+	if len(uses) != 2 || uses[0] != "./service" || uses[1] != "./library" {
+		t.Fatalf("workspace members not parsed: %v", uses)
+	}
+	if len(replaces) != 2 {
+		t.Fatalf("expected two replacements, got %+v", replaces)
+	}
+	if !replaces[0].Local {
+		t.Errorf("filesystem replacement not marked local: %+v", replaces[0])
+	}
+	if replaces[1].NewVersion != "v1.2.0" {
+		t.Errorf("version replacement not parsed: %+v", replaces[1])
+	}
+}
+
+func TestParseNPMLockRejectsUnsupportedFormats(t *testing.T) {
+	cases := []struct {
+		name string
+		data string
+		want string
+	}{
+		{"future version", `{"lockfileVersion": 9, "packages": {"": {}}}`, "newer than the supported"},
+		{"v3 without packages", `{"lockfileVersion": 3}`, "requires a packages map"},
+		{"empty lockfile", `{}`, "not a usable lockfile"},
+		{"invalid json", `{`, "invalid JSON"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := parseNPMLock("package-lock.json", []byte(c.data))
+			if err == nil {
+				t.Fatal("malformed lockfile accepted")
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("error %q does not mention %q", err, c.want)
+			}
+		})
+	}
+}
+
+func TestParseNPMLockSkipsNonRegistrySources(t *testing.T) {
+	data := []byte(`{
+	  "lockfileVersion": 3,
+	  "packages": {
+	    "": {"dependencies": {"registry-pkg": "^1.0.0", "linked-pkg": "file:../linked"}},
+	    "node_modules/registry-pkg": {"version": "1.2.3", "resolved": "https://registry.npmjs.org/registry-pkg/-/registry-pkg-1.2.3.tgz"},
+	    "node_modules/linked-pkg": {"version": "1.0.0", "resolved": "file:../linked"}
+	  }
+	}`)
+	res, err := parseNPMLock("package-lock.json", data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Packages) != 1 || res.Packages[0].Name != "registry-pkg" {
+		t.Fatalf("non-registry packages must be skipped: %+v", res.Packages)
+	}
+	if !res.Packages[0].Direct {
+		t.Error("registry-pkg should be classified as a direct dependency")
+	}
+	joined := strings.Join(res.Warnings, " ")
+	if !strings.Contains(joined, "linked-pkg") || !strings.Contains(joined, "non-registry") {
+		t.Fatalf("the skipped package was not disclosed: %v", res.Warnings)
+	}
+}
+
+func TestParseNPMLockDetectsStaleLockfile(t *testing.T) {
+	// package.json declares left-pad, but the lockfile has no entry for it: npm
+	// install has not been run since the dependency was added.
+	data := []byte(`{
+	  "lockfileVersion": 3,
+	  "packages": {
+	    "": {"dependencies": {"left-pad": "^1.3.0"}},
+	    "node_modules/other": {"version": "2.0.0"}
+	  }
+	}`)
+	res, err := parseNPMLock("package-lock.json", data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(res.Warnings, " "), "missing from the lockfile") {
+		t.Fatalf("stale lockfile not reported: %v", res.Warnings)
+	}
+}
+
+func TestParseNPMLockClassifiesDirectAndTransitive(t *testing.T) {
+	data := []byte(`{
+	  "lockfileVersion": 2,
+	  "packages": {
+	    "": {"dependencies": {"direct-pkg": "^1.0.0"}, "devDependencies": {"dev-pkg": "^2.0.0"}},
+	    "node_modules/direct-pkg": {"version": "1.1.0"},
+	    "node_modules/dev-pkg": {"version": "2.1.0", "dev": true},
+	    "node_modules/direct-pkg/node_modules/nested": {"version": "3.0.0"}
+	  }
+	}`)
+	res, err := parseNPMLock("package-lock.json", data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]Package{}
+	for _, p := range res.Packages {
+		byName[p.Name] = p
+	}
+	if !byName["direct-pkg"].Direct {
+		t.Error("direct-pkg should be direct")
+	}
+	if byName["nested"].Direct {
+		t.Error("nested should be transitive")
+	}
+	if !byName["dev-pkg"].Development {
+		t.Error("dev-pkg should be marked as a development dependency")
 	}
 }

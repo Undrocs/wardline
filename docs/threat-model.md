@@ -57,10 +57,15 @@ and the report destination.
    values. Evidence is constructed through `internal/security` masking helpers,
    never from a raw match.
 4. **Reports → disk/stdout.** Only repository-relative paths and redacted
-   evidence are rendered. `--output` files are created with mode `0600`.
+   evidence are rendered. `--output` files are created with mode `0600` through a
+   temporary file and an atomic rename; a symlink or non-regular destination is
+   refused.
 5. **Engine → network.** Only the dependency scanner may open a connection, and
-   only when `network.enabled` is true and `--offline` is absent. The client
-   posts `{ecosystem, name, version}` triples and nothing else.
+   only when `network.enabled` is true and `--offline` is absent. The destination
+   must pass `internal/netguard` (official endpoint, or an operator-approved
+   custom one; never loopback, private, link-local or cloud-metadata addresses),
+   and both redirects and the dialled IP are re-checked. The client posts
+   `{ecosystem, name, version}` triples and nothing else.
 
 ## Threats Wardline itself must resist
 
@@ -69,6 +74,10 @@ and the report destination.
 | **Code execution from a scanned repository.** A crafted workflow, Dockerfile or lockfile tries to run a command during scanning. | Scanners parse text and structure only. No `exec`, no shell, no package manager, no container runtime is ever invoked. Workflows are parsed with a YAML reader, never run. |
 | **Path traversal / symlink escape.** A symlink points at `~/.ssh` or `/etc`. | Symlinks are skipped by the walker; `security.IsWithinRoot` and `security.WithinRootOnce` reject escaping and `..`-bearing paths; Compose and Dockerfile paths are reported as text, never opened. |
 | **Memory or CPU exhaustion.** A 5 GiB file, 10⁶ files, deeply nested YAML. | `limits.maxFileSize` (default 2 MiB), `limits.maxFiles` (default 200 000, exceeding it is an error), binary detection, YAML depth limit, bounded response bodies (32 MiB), scan timeout (default 10m) and `--timeout`. |
+| **Scan-policy weakening by the repository.** `.wardline.yaml` ships inside the repository being audited, so it can disable scanners, add suppressions or lower the threshold. | Under `--strict`, the resolved configuration is passed through `applyStrictPolicy`: every scanner must stay enabled, suppressions are dropped, `failOn` cannot be weaker than `high`, and each override is listed in the report. Disabled scanners are always listed, whatever the mode. |
+| **Network redirection through configuration.** A repository points `network.osvEndpoint` at an attacker host, a metadata service, or an internal address. | The endpoint is validated before a client exists: the default is the official HTTPS endpoint, a custom endpoint requires `--allow-custom-endpoint`, plain HTTP and loopback/private/link-local/metadata addresses are refused even then, redirects are re-validated, and connections are re-checked at dial time against the resolved address. |
+| **File substitution between walk and read (TOCTOU).** A writer swaps a file for a symlink or a different inode after it was enumerated. | Each file carries the `os.FileInfo` seen by the walk; scanners open with `O_NOFOLLOW` where the platform supports it and verify identity (`os.SameFile`) and size before parsing. A mismatch is reported as a skipped check. |
+| **Report file attack.** `--output` points at a symlink, an existing file owned by someone else, or a path in a directory the attacker controls. | Report writing creates a temporary file in the destination directory with mode `0600`, writes and syncs it, then renames; a symlink or non-regular destination is refused, and a failed render leaves the previous report and removes the temporary file. |
 | **Secret exposure in the report.** A scanner prints the match, a log line, or an error that embeds the secret. | Single masking choke point (`MaskSecret`, `SanitizeEvidence`); every scanner builds evidence via these helpers; tests assert that no fixture secret appears in terminal, JSON, Markdown or SARIF output. |
 | **Secret exfiltration.** A covert channel sends content to a third party. | No telemetry, no analytics, no crash reporting, no auto-upload. The only outbound call is the OSV batch query, and the destination is recorded in `report.network`. `--offline` guarantees zero requests. |
 | **Silent failure presented as success.** A scanner crashes, a network call fails, a file cannot be read, and the report still says "clean". | Per-scanner status (`ran`/`partial`/`skipped`/`failed`), skipped checks with reasons, `summary.incomplete`, an `INCOMPLETE` banner in the terminal renderer, and exit code 3 for operational failure. |
@@ -103,6 +112,9 @@ and the report destination.
   strictly read-only; remediation is text, not mutation.
 - **Automatic upload of results to a dashboard.** Rejected for the MVP: no
   telemetry, no accounts, no server component.
+- **Running `git` inside the scanned repository** (to decide whether a `.env`
+  file is tracked). Rejected: the claim is removed from the rule instead, and the
+  remediation explains how an operator can check.
 - **A suppression mechanism that hides findings without justification.**
   Rejected: `suppressions[].reason` is mandatory, suppressions are visible in
   the report, and findings remain listed as suppressed rather than deleted.

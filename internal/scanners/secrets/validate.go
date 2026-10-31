@@ -9,9 +9,12 @@ import (
 )
 
 // localHosts are hostnames that indicate a local development connection string.
-// A credential for localhost is still a secret, but it is not evidence of a
-// production credential leak, and reporting every docker-compose default would
-// bury real findings.
+//
+// A password for localhost is still a credential: development credentials are
+// routinely reused in production, and a committed connection string is a leak
+// regardless of the host. These matches are reported at low confidence rather
+// than suppressed, so the report says "this may be a local default" without
+// hiding the value.
 var localHosts = []string{
 	"localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal",
 	"db", "database", "postgres", "mysql", "redis", "mongo", "mongodb", "cache",
@@ -64,11 +67,8 @@ func validateDatabaseURL(line string, match []int) bool {
 	if idx := strings.LastIndex(hostname, ":"); idx >= 0 {
 		hostname = hostname[:idx]
 	}
-	for _, local := range localHosts {
-		if hostname == local || strings.HasPrefix(hostname, local+".") {
-			return false
-		}
-	}
+	// A loopback or compose-service host is still reported: the credential is
+	// real, and Rule.ConfidenceForMatch lowers its confidence instead.
 	if strings.HasSuffix(hostname, ".example") || strings.HasSuffix(hostname, ".invalid") {
 		return false
 	}
@@ -79,6 +79,33 @@ func validateDatabaseURL(line string, match []int) bool {
 		return false
 	}
 	return true
+}
+
+// isLocalHost reports whether a connection-string host is a loopback or
+// compose-service name rather than a remote endpoint.
+func isLocalHost(hostname string) bool {
+	for _, local := range localHosts {
+		if hostname == local || strings.HasPrefix(hostname, local+".") {
+			return true
+		}
+	}
+	return false
+}
+
+// databaseURLIsLocal reports whether the matched connection string points at a
+// local development host, which lowers the confidence of the finding.
+func databaseURLIsLocal(line []byte, match []int) bool {
+	group := func(i int) string {
+		if 2*i+1 >= len(match) || match[2*i] < 0 {
+			return ""
+		}
+		return string(line[match[2*i]:match[2*i+1]])
+	}
+	host := strings.ToLower(group(4))
+	if idx := strings.LastIndex(host, ":"); idx >= 0 {
+		host = host[:idx]
+	}
+	return isLocalHost(host)
 }
 
 // validatePassword rejects literals that are configuration indirection,

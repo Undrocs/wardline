@@ -41,6 +41,10 @@ type Options struct {
 	Scanners []scanners.Scanner
 	// HTTPClient is forwarded to network-capable scanners.
 	HTTPClient *http.Client
+	// DisabledScanners lists scanner names that were not selected. They are
+	// reported as disabled rather than omitted, so a report always states which
+	// checks did not run.
+	DisabledScanners []string
 	// Now is injectable for deterministic tests.
 	Now func() time.Time
 }
@@ -57,6 +61,10 @@ type ScannerRun struct {
 	Notes      []string                `json:"notes,omitempty"`
 	Warnings   []string                `json:"warnings,omitempty"`
 	Error      string                  `json:"error,omitempty"`
+	// Disabled is true when the scanner was not selected at all, either by the
+	// command line or by configuration. A disabled scanner is listed in the
+	// report instead of disappearing from it.
+	Disabled bool `json:"disabled,omitempty"`
 }
 
 // Result is the complete output of a scan.
@@ -175,11 +183,23 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 
 	all = applyRuleSettings(all, cfg, &res.Warnings)
 	all = applySuppressions(all, cfg, res.StartedAt, &res.Warnings)
+	relativizeFindings(root, all)
 	all = findings.Dedupe(all)
 	findings.Sort(all)
 	res.Findings = all
 
-	runs := make([]ScannerRun, 0, len(outcomes))
+	runs := make([]ScannerRun, 0, len(outcomes)+len(opts.DisabledScanners))
+	for _, name := range opts.DisabledScanners {
+		runs = append(runs, ScannerRun{
+			Name:     name,
+			Status:   scanners.StatusSkipped,
+			Disabled: true,
+			Skipped: []scanners.SkippedCheck{{
+				Check:  name + " scanner",
+				Reason: "not selected: the scanner is disabled by configuration or was not requested",
+			}},
+		})
+	}
 	for _, out := range outcomes {
 		run := out.ScannerRun
 		counts := findings.Counts{}
@@ -273,6 +293,23 @@ func runOne(ctx context.Context, sc scanners.Scanner, req *scanners.Request) (ou
 	out.network = res.Network
 	out.findings = res.Findings
 	return out
+}
+
+// relativizeFindings guarantees that no finding carries an absolute filesystem
+// path into a report. The engine already hands scanners relative paths, so this
+// is a safety net for a scanner that builds its own location.
+func relativizeFindings(root string, all []findings.Finding) {
+	for i := range all {
+		path := all[i].Location.Path
+		if path == "" || !filepath.IsAbs(path) {
+			continue
+		}
+		if rel, err := filepath.Rel(root, path); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			all[i].Location.Path = filepath.ToSlash(rel)
+			continue
+		}
+		all[i].Location.Path = filepath.Base(path)
+	}
 }
 
 // applyRuleSettings applies rules.disable and rules.severity from configuration.

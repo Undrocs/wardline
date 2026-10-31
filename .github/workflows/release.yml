@@ -1,18 +1,27 @@
 name: Release
 
-# Builds release archives for Linux, macOS and Windows on amd64 and arm64 and
-# attaches them, with a SHA-256 checksum file, to a GitHub release.
+# Builds release archives for Linux, macOS and Windows on amd64 and arm64,
+# verifies every archive, and attaches it with a SHA-256 checksum file to a
+# GitHub release.
 #
-# This workflow is scaffolding: it only runs when a tag matching v* is pushed
-# (or when started manually). No release has been published for this project
-# yet, and no artifacts are committed to the repository.
+# Publishing requires explicit approval: the `publish` job runs in the `release`
+# environment, which must be configured with required reviewers (repository
+# settings -> Environments). Without that configuration the job still waits for
+# the environment's protection rules; it never publishes unattended.
 #
 # Security notes:
 #   - actions are pinned to full commit SHAs;
 #   - the default permission is contents: read; only the publish job is granted
-#     contents: write, and it runs after every build job succeeds;
-#   - no third-party release action is used: archives are built with the Go
-#     toolchain and published with the GitHub CLI that ships on the runner.
+#     contents: write;
+#   - no third-party release action is used: archives are built by
+#     scripts/build-release-archive.sh and verified by
+#     scripts/verify-release-archive.sh before publication;
+#   - the requested tag is validated, checked out explicitly, and the built
+#     commit is compared with the tag before anything is packaged;
+#   - the pushed tag must match a repository tag-protection rule, so a release
+#     cannot be cut from an unprotected (rewritable) tag;
+#   - existing release assets are never overwritten: a release is immutable
+#     once published, and a re-run fails instead of silently replacing binaries.
 
 on:
   push:
@@ -21,7 +30,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build and publish (for example v0.1.0)"
+        description: "Existing protected tag to build and publish (for example v0.1.0)"
         required: true
         type: string
 
@@ -32,8 +41,95 @@ env:
   CGO_ENABLED: "0"
 
 jobs:
+  # Resolve and validate the tag once so every later job uses the same,
+  # already-validated value. The tag is never interpolated into a shell script
+  # body directly: it is written to an output and passed through the
+  # environment.
+  prepare:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      commit: ${{ steps.resolve.outputs.commit }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          # On a tag push this is the tag itself; on a manual run it is the
+          # requested tag, which is validated before it is used anywhere.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Resolve and validate the tag
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.TAG_PROTECTION_TOKEN || github.token }}
+          REQUIRE_PROTECTED_TAGS: ${{ vars.REQUIRE_PROTECTED_TAGS || 'true' }}
+        run: |
+          set -eu
+          tag="${REF_NAME}"
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            tag="${DISPATCH_TAG}"
+          fi
+          if ! printf '%s' "${tag}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?(\+[0-9A-Za-z.]+)?$'; then
+            echo "::error::'${tag}' is not a release tag of the form vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+
+          # The tag must exist and must be what we checked out: a release whose
+          # binary was built from a different commit than the tag points to is
+          # impossible to verify after publication.
+          tag_commit="$(git rev-parse "refs/tags/${tag}^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          if [ "${tag_commit}" != "${head_commit}" ]; then
+            echo "::error::checkout ${head_commit} does not match tag ${tag} (${tag_commit})"
+            exit 1
+          fi
+
+          # Tag protection: refuse to publish from a tag that a repository
+          # protection rule does not cover, because such a tag can be moved or
+          # deleted after the release is published.
+          #
+          # Reading protection rules needs repository admin permission, which
+          # the default token does not have. Provide a token in the
+          # TAG_PROTECTION_TOKEN secret, or set the REQUIRE_PROTECTED_TAGS
+          # repository variable to "false" only after configuring equivalent
+          # protection. The default is to require it.
+          if [ "${REQUIRE_PROTECTED_TAGS}" = "false" ]; then
+            echo "::warning::tag protection check disabled by REQUIRE_PROTECTED_TAGS"
+          else
+            if ! patterns="$(gh api "repos/${REPO}/tags/protection" --jq '.[].pattern' 2>/dev/null)"; then
+              echo "::error::cannot read tag protection rules. Configure tag protection for 'v*', store a token with admin:read in the TAG_PROTECTION_TOKEN secret, or set REQUIRE_PROTECTED_TAGS=false after configuring equivalent protection."
+              exit 1
+            fi
+            matched=0
+            for pattern in ${patterns}; do
+              case "${tag}" in
+              ${pattern}) matched=1 ;;
+              esac
+            done
+            if [ "${matched}" -ne 1 ]; then
+              echo "::error::tag '${tag}' is not covered by a tag protection rule (configured: ${patterns:-none})"
+              exit 1
+            fi
+          fi
+
+          {
+            echo "tag=${tag}"
+            echo "version=${tag#v}"
+            echo "commit=${head_commit}"
+          } >>"${GITHUB_OUTPUT}"
+          echo "releasing ${tag} from ${head_commit}"
+
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -42,26 +138,21 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
-            archive: tar.gz
           - goos: linux
             goarch: arm64
-            archive: tar.gz
           - goos: darwin
             goarch: amd64
-            archive: tar.gz
           - goos: darwin
             goarch: arm64
-            archive: tar.gz
           - goos: windows
             goarch: amd64
-            archive: zip
           - goos: windows
             goarch: arm64
-            archive: zip
     steps:
-      - name: Check out repository
+      - name: Check out the release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ needs.prepare.outputs.tag }}
           fetch-depth: 0
 
       - name: Set up Go
@@ -70,47 +161,35 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Confirm the checked-out commit is the tag
+        env:
+          EXPECTED_COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: |
+          set -eu
+          actual="$(git rev-parse HEAD)"
+          if [ "${actual}" != "${EXPECTED_COMMIT}" ]; then
+            echo "::error::checked out ${actual}, expected ${EXPECTED_COMMIT}"
+            exit 1
+          fi
+
       - name: Test before packaging
         run: go test ./... -timeout 300s
 
-      - name: Build archive
+      - name: Build and verify archive
         env:
+          TAG: ${{ needs.prepare.outputs.tag }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          ARCHIVE: ${{ matrix.archive }}
-          # Event data is passed through the environment, never interpolated
-          # into the script body.
-          DISPATCH_TAG: ${{ inputs.tag }}
         run: |
           set -eu
-          tag="${GITHUB_REF_NAME}"
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            tag="${DISPATCH_TAG}"
+          # Same-platform archives are executed, which proves the binary in the
+          # archive actually runs and reports the released version.
+          run_flag=""
+          if [ "${GOOS}/${GOARCH}" = "$(go env GOHOSTOS)/$(go env GOHOSTARCH)" ]; then
+            run_flag="--run"
           fi
-          version="${tag#v}"
-          commit="$(git rev-parse HEAD)"
-          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          name="wardline_${version}_${GOOS}_${GOARCH}"
-
-          mkdir -p "dist/${name}"
-          go build -trimpath \
-            -ldflags "-s -w \
-              -X github.com/Undrocs/wardline/internal/version.Version=${version} \
-              -X github.com/Undrocs/wardline/internal/version.Commit=${commit} \
-              -X github.com/Undrocs/wardline/internal/version.BuildDate=${build_date}" \
-            -o "dist/${name}/wardline" ./cmd/wardline
-
-          # Ship the license, notices and user documentation with the binary.
-          cp LICENSE THIRD-PARTY-NOTICES.md README.md CHANGELOG.md "dist/${name}/"
-
-          # Reproducible archive: fixed mtime/owner and sorted entries.
-          if [ "${GOOS}" = "windows" ]; then
-            (cd dist && rm -f "${name}.zip" && zip -qr9 "${name}.zip" "${name}")
-          else
-            (cd dist && tar --sort=name --owner=0 --group=0 --numeric-owner \
-              --mtime='UTC 2026-01-01' -czf "${name}.${ARCHIVE}" "${name}")
-          fi
-          (cd dist && sha256sum "${name}.${ARCHIVE}" > "${name}.${ARCHIVE}.sha256")
+          archive="$(./scripts/build-release-archive.sh "${TAG}" "${GOOS}" "${GOARCH}" dist)"
+          ./scripts/verify-release-archive.sh "${archive}" "${GOOS}" "${GOARCH}" ${run_flag}
 
       - name: Upload archives
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -125,21 +204,79 @@ jobs:
 
   publish:
     name: Publish release
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Requires reviewer approval for the `release` environment.
+    environment: release
     permissions:
       contents: write
-      actions: read
     steps:
-      - name: Check out repository
+      - name: Check out the release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Confirm the checked-out commit is the tag
+        env:
+          EXPECTED_COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: |
+          set -eu
+          actual="$(git rev-parse HEAD)"
+          if [ "${actual}" != "${EXPECTED_COMMIT}" ]; then
+            echo "::error::checked out ${actual}, expected ${EXPECTED_COMMIT}"
+            exit 1
+          fi
 
       - name: Download archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
+
+      - name: Verify every archive
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -eu
+          failed=0
+          for archive in dist/*.tar.gz dist/*.zip; do
+            [ -e "${archive}" ] || continue
+            base="$(basename "${archive}")"
+            case "${base}" in
+            *_windows_*) goos=windows ;;
+            *_linux_*) goos=linux ;;
+            *_darwin_*) goos=darwin ;;
+            *)
+              echo "::error::cannot tell the platform of ${base}"
+              failed=1
+              continue
+              ;;
+            esac
+            case "${base}" in
+            *_amd64.*) goarch=amd64 ;;
+            *_arm64.*) goarch=arm64 ;;
+            *)
+              echo "::error::cannot tell the architecture of ${base}"
+              failed=1
+              continue
+              ;;
+            esac
+            ./scripts/verify-release-archive.sh "${archive}" "${goos}" "${goarch}" || failed=1
+          done
+          if [ "${failed}" -ne 0 ]; then
+            exit 1
+          fi
+          # Every platform must be present: a release missing one silently
+          # strands users on that platform.
+          for platform in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64 windows_arm64; do
+            if ! ls dist/*_"${platform}".* >/dev/null 2>&1; then
+              echo "::error::no archive for ${platform}"
+              failed=1
+            fi
+          done
+          [ "${failed}" -eq 0 ]
 
       - name: Assemble checksums
         run: |
@@ -154,18 +291,17 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          DISPATCH_TAG: ${{ inputs.tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -eu
-          tag="${GITHUB_REF_NAME}"
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            tag="${DISPATCH_TAG}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            # Assets are immutable once published. Replacing a binary under an
+            # existing tag would invalidate every checksum users already have,
+            # so a partial or repeated run fails instead of overwriting.
+            echo "::error::release ${TAG} already exists; publish a new tag instead of overwriting its assets"
+            exit 1
           fi
-          if gh release view "${tag}" > /dev/null 2>&1; then
-            gh release upload "${tag}" dist/* --clobber
-          else
-            gh release create "${tag}" dist/* \
-              --verify-tag \
-              --title "Wardline ${tag}" \
-              --notes "See CHANGELOG.md for the changes in this release. Verify downloads with SHA256SUMS."
-          fi
+          gh release create "${TAG}" dist/* \
+            --verify-tag \
+            --title "Wardline ${TAG}" \
+            --notes "See CHANGELOG.md for the changes in this release. Verify downloads with SHA256SUMS."

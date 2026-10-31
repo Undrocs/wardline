@@ -16,7 +16,8 @@ internal/cli/             argument parsing, command dispatch, output handling
 internal/config/          .wardline.yaml schema, validation, defaults
 internal/engine/          file collection, scanner orchestration, rule policy
 internal/findings/        Severity/Confidence, Finding, dedupe, fingerprints
-internal/security/        redaction, bounded file reads, path and binary checks
+internal/security/        redaction, verified bounded file reads, path and binary checks
+internal/netguard/        outbound destination policy (scheme, host class, dial, redirects)
 internal/scanners/        Scanner interface and shared request/result types
 internal/scanners/secrets
 internal/scanners/dependencies
@@ -40,6 +41,7 @@ main
  └─ cli.Run
      ├─ flag parsing / reordering (positional path may precede flags)
      ├─ config.Discover or config.Load ── invalid → exit 2, no scanning
+     ├─ endpoint approval + strict policy (repository config is untrusted)
      ├─ engine.Run(ctx, Options)
      │   ├─ walk: bounded, symlink-aware, exclusion-aware file collection
      │   ├─ for each enabled scanner (bounded worker pool):
@@ -67,6 +69,14 @@ exclusions are consistent. The walker:
   `limits.maxFiles` (exceeding it is an operational error: a truncated file list
   would make the scan silently incomplete);
 - honours `ctx` cancellation between entries.
+
+Each scanned file carries its `os.FileInfo` from the walk. Scanners re-open the
+file with `security.ReadFileLimitedVerified`, which opens with `O_NOFOLLOW` where
+the platform supports it and then compares identity and size
+(`os.SameFile`, `Size()`) with the walk's snapshot. A file that was replaced,
+symlinked or grown between the walk and the read is rejected with
+`ErrFileChanged` and reported, so a scan cannot be redirected at a different
+file by a concurrent writer.
 
 ### Scanner contract
 
@@ -138,10 +148,20 @@ Fingerprints are stable within a schema version and are emitted in SARIF as
 `internal/security` is the only place allowed to touch raw secret material:
 
 - `MaskSecret` keeps a short prefix for identification and masks the rest.
-- `SanitizeEvidence` strips control characters, collapses whitespace, bounds
-  length, and runs token scrubbing.
+- `RedactCredentials` masks assignments (`password=`, `api_key:`), URL userinfo,
+  HTTP auth schemes (`Authorization: Bearer …`), credentials passed as separate
+  command-line arguments (`curl -u user:pass`, `--password …`),
+  vendor-prefixed tokens, long random tokens and private key headers. It is
+  idempotent, because reporters run it again as a safety net.
+- `RedactEvidence` redacts first and truncates second, so a credential can never
+  be cut in half and survive as an unrecognised fragment.
+- `SanitizeEvidence` strips control characters, collapses whitespace and bounds
+  length.
 - Scanners never place a raw match into `findings.Finding`; evidence is built by
-  the masking helpers only.
+  the masking helpers only. Finding constructors (`newConfigFinding`,
+  `newFinding`, secrets' `buildFinding`) apply `RedactEvidence` themselves, so a
+  new rule cannot forget it.
+- Reporters redact every string again before rendering.
 - No scanner logs match contents. `--verbose` diagnostics name rules, files and
   counts, never values.
 - Nothing is written to disk except the report the user asked for (`--output`,
@@ -149,15 +169,39 @@ Fingerprints are stable within a schema version and are emitted in SARIF as
 
 ## Network
 
-Dependency scanning is the only network user. The OSV client:
+Dependency scanning is the only network user. `internal/netguard` decides what
+may be contacted, and it is applied at three levels:
+
+1. **Configuration.** `network.osvEndpoint` comes from the scanned repository, so
+   it is validated before a client is built: the default is the official HTTPS
+   endpoint, a custom endpoint requires explicit approval
+   (`--allow-custom-endpoint`), and plain HTTP, loopback, link-local, private,
+   unique-local and cloud-metadata addresses are refused even with approval.
+2. **Dial.** Every connection passes through a `net.Dialer` control function that
+   re-checks the resolved IP address, which closes the DNS-rebinding gap between
+   the URL check and the connection.
+3. **Redirects.** Each redirect target is re-validated against the same policy;
+   a redirect is the obvious way for a permitted host to reach a forbidden one.
+
+The OSV client:
 
 - posts only `{ecosystem, name, version}` triples in batches of 500;
 - sends a fixed `User-Agent` (`wardline/<version>`) that contains no repository,
   path or user information;
 - caps response bodies (32 MiB), retries 5xx and transport errors twice more
   (three attempts in total) with backoff, and does not retry 4xx responses;
+- distinguishes rate limiting (`429`, surfaced as `osv.ErrRateLimited`) from a
+  malformed or rejected request;
+- treats a batch response whose result count differs from the query count as an
+  error rather than as an empty (apparently clean) result;
 - respects the scan context, so cancellation and `--timeout` interrupt requests;
 - caches vulnerability detail lookups per run.
+
+A lookup that fails after the first batch keeps the results already obtained,
+names the packages that were never queried, and records a skipped check. A
+failed advisory detail request keeps its finding (the vulnerability was
+detected) and is reported as reduced metadata instead — the two failure modes
+are reported separately.
 
 `--offline`, or `network.enabled: false`, prevents construction of an HTTP
 client at all. The dependency scanner then reports a skipped check, the report
@@ -176,6 +220,8 @@ records `network.enabled: false`, and exit code 0 is accompanied by an
 | `scanners` | One entry per scanner: status, findings count, scope, notes, skipped checks, error. |
 | `findings` | Normalised findings, sorted, deduplicated, secrets redacted. |
 | `summary` | Counts by severity, suppressed counts, scanner status tallies, `incomplete`, policy outcome. |
+| `summary.policy` | The evaluated failure threshold, whether it was met, and why. |
+| `policyNotices` | Policy decisions the operator must see, including overrides that `--strict` neutralised. |
 | `warnings` / `errors` | Non-fatal diagnostics and scanner failures. |
 | `limitations` | Scan-level caveats that always include the working-tree and heuristic-detection statements. |
 
@@ -194,6 +240,9 @@ paths.
 2. `2` — usage or configuration error, detected before scanning.
 3. `1` — the policy threshold was met.
 4. `0` — otherwise.
+
+`--fail-incomplete` adds a third outcome: a scan that did not cover everything
+exits `3` even when no finding met the threshold.
 
 The policy is evaluated over every unsuppressed finding in the scan, regardless
 of `--severity` or `--min-confidence` filters. Filtering changes what a human

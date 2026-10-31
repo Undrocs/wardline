@@ -90,7 +90,7 @@ func checkCompose(rel string, data []byte) ([]findings.Finding, error) {
 				user := strings.TrimSpace(s)
 				if user == "root" || user == "0" || strings.HasPrefix(user, "0:") || strings.HasPrefix(user, "root:") {
 					out = append(out, newComposeFinding(ruleComposeRootUser, rel, v.Line, loc("user"),
-						fmt.Sprintf("service %s: user: %s", svc.Key, security.SanitizeEvidence(user, 20))))
+						fmt.Sprintf("service %s: user: %s", svc.Key, security.RedactEvidence(user, 20))))
 				}
 			}
 		}
@@ -143,13 +143,13 @@ func checkComposeVolumes(rel, service string, body *yamlpos.Node) []findings.Fin
 		if strings.Contains(lower, "docker.sock") {
 			out = append(out, newComposeFinding(ruleDockerSocket, rel, line,
 				fmt.Sprintf("services.%s.volumes%s.dockerSock", service, locatorSuffix),
-				fmt.Sprintf("service %s mounts %s", service, security.SanitizeEvidence(src, 80))))
+				fmt.Sprintf("service %s mounts %s", service, security.RedactEvidence(src, 80))))
 			return
 		}
 		if isSensitiveHostPath(lower) {
 			out = append(out, newComposeFinding(ruleSensitiveMount, rel, line,
-				fmt.Sprintf("services.%s.volumes%s.%s", service, locatorSuffix, security.SanitizeEvidence(src, 40)),
-				fmt.Sprintf("service %s mounts %s", service, security.SanitizeEvidence(src, 80))))
+				fmt.Sprintf("services.%s.volumes%s.%s", service, locatorSuffix, security.RedactEvidence(src, 40)),
+				fmt.Sprintf("service %s mounts %s", service, security.RedactEvidence(src, 80))))
 		}
 	}
 	for i, item := range volumes.Seq() {

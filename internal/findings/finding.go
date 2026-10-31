@@ -133,6 +133,13 @@ func New(f Finding) Finding {
 //
 // The locator should be structural (YAML path, package name, secret rule inside
 // a file) rather than a line number so that unrelated edits do not change it.
+//
+// SHA-256 is used here as a collision-resistant, deterministic fingerprint of
+// values that are already redacted — a locator for an inline secret is the
+// *masked* token, never a credential. It is not password hashing and no value
+// hashed here is ever used to authenticate anything; the digest is an
+// identifier that survives unrelated edits. A fast hash is the right choice:
+// this runs once per finding and is never used to protect a secret.
 func Fingerprint(ruleID, path, locator string) string {
 	sum := sha256.Sum256([]byte(ruleID + "\x00" + path + "\x00" + locator))
 	return hex.EncodeToString(sum[:8])

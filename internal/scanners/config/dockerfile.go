@@ -106,7 +106,7 @@ func checkDockerfile(rel string, data []byte) []findings.Finding {
 			if user == "root" || user == "0" || strings.HasPrefix(user, "0:") || strings.HasPrefix(user, "root:") {
 				out = append(out, newDockerFinding(ruleRootUserExplicit, rel, ins.Line,
 					fmt.Sprintf("instructions.USER[%d]", ins.Line),
-					"USER "+security.SanitizeEvidence(user, 40)))
+					"USER "+security.RedactEvidence(user, 40)))
 			}
 		case "ENV", "ARG":
 			for _, kv := range parseKeyValues(ins.Args) {
@@ -132,7 +132,7 @@ func checkDockerfile(rel string, data []byte) []findings.Finding {
 				if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "git@") || strings.HasSuffix(lower, ".git") {
 					out = append(out, newDockerFinding(ruleRemoteAdd, rel, ins.Line,
 						fmt.Sprintf("instructions.ADD[%d]", ins.Line),
-						"ADD "+security.SanitizeEvidence(src, 100)))
+						"ADD "+security.RedactEvidence(src, 100)))
 				}
 			}
 			out = append(out, checkCopiedCredentials(rel, ins)...)
@@ -142,12 +142,12 @@ func checkDockerfile(rel string, data []byte) []findings.Finding {
 			if match := remoteScriptPattern.FindString(ins.Args); match != "" {
 				out = append(out, newDockerFinding(ruleRemoteScript, rel, ins.Line,
 					fmt.Sprintf("instructions.RUN[%d]", ins.Line),
-					"RUN "+security.SanitizeEvidence(match, 100)))
+					"RUN "+security.RedactEvidence(match, 100)))
 			}
 			if chmodWorldWritable.MatchString(ins.Args) {
 				out = append(out, newDockerFinding(ruleWorldWritable, rel, ins.Line,
 					fmt.Sprintf("instructions.RUN[%d].chmod", ins.Line),
-					"RUN "+security.SanitizeEvidence(ins.Args, 100)))
+					"RUN "+security.RedactEvidence(ins.Args, 100)))
 			}
 		}
 	}
@@ -177,7 +177,7 @@ func checkCopiedCredentials(rel string, ins instruction) []findings.Finding {
 		}
 		out = append(out, newDockerFinding(ruleCredentialCopy, rel, ins.Line,
 			fmt.Sprintf("instructions.%s[%d].%s", ins.Keyword, ins.Line, clean),
-			ins.Keyword+" "+security.SanitizeEvidence(src, 100)))
+			ins.Keyword+" "+security.RedactEvidence(src, 100)))
 	}
 	return out
 }
